@@ -6,3 +6,4 @@ node_modules/
 # Launch media: dependencies and rendered frames.
 media-src/node_modules/
 media-src/frames/
+__pycache__/

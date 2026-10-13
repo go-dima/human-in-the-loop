@@ -2,6 +2,9 @@ import type { On, PaneOpenArgs, PromptSubmitInput } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 
+import { rowsFor } from '../hooks/pane'
+import { cellsOf, rowsOf, wrapRows } from '../hooks/text'
+
 const ASSIGN = 'mcp__human-in-the-loop__assign_task'
 const LIST = 'mcp__human-in-the-loop__list_tasks'
 const WITHDRAW = 'mcp__human-in-the-loop__withdraw_task'
@@ -262,6 +265,143 @@ describe('assigning', () => {
     expect(world.isPaneOpen).toBe(false)
     expect(world.status).toBeUndefined()
     expect(world.toasts.at(-1)).toBe('Claude withdrew the task: Add STRIPE_SECRET_KEY to .env. Found the key in the vault')
+  })
+})
+
+/**
+ * Two tasks with titles near the 80 characters a title may have, as an
+ * earlier session left them. The live check (tests/live/test_pane.py) draws
+ * them in a real Claude Code; the row counts here are what it drew.
+ */
+const INSTRUMENTS = {
+  ...ROTATE,
+  id: 1,
+  title: 'Open Instruments from Xcode and record with the Activity Monitor template',
+  why: 'I need a trace of the launch to see where the 4 seconds go.',
+  doneWhen: 'The .trace file is in ~/traces.',
+  createdMs: NOW - 180_000,
+} as const
+
+const XCODE_LONG = {
+  ...ROTATE,
+  id: 2,
+  title: 'Run xcodebuild test on your Mac and paste every failure you see here please',
+  why: "I can't run Xcode here.",
+  kind: 'answer',
+  createdMs: NOW - 180_000,
+} as const
+
+/** The pane seated inline above the prompt, `bodyColumns` across. */
+function inline(bodyColumns: number) {
+  return { ...PANE, props: { ...PANE.props, placement: 'inline', bodyColumns } } as const
+}
+
+function earlier(tasks: readonly unknown[]) {
+  return { 'tasks:/repo': { nextId: 3, sessions: { 'session-0': { tasks, seenMs: 0, endedMs: 0 } } } }
+}
+
+describe('long titles', () => {
+  test('wrap as the terminal wraps them: at spaces, a word wider than the row broken where it ends', () => {
+    expect(wrapRows(' a b c d e f g h i j k l m n o p q r s t u v w x y z A B C D E F G H I J  3m · from an earlier session', 32)).toEqual([
+      ' a b c d e f g h i j k l m n o p',
+      ' q r s t u v w x y z A B C D E F',
+      ' G H I J  3m · from an earlier ',
+      'session',
+    ])
+    expect(wrapRows('#3 Datenbankverbindungseinstellungsüberprüfungsprotokoll im Ordner ablegen', 30)).toEqual([
+      '#3 Datenbankverbindungseinstel',
+      'lungsüberprüfungsprotokoll im ',
+      'Ordner ablegen',
+    ])
+    expect(cellsOf('ステージング')).toBe(12)
+    expect(rowsOf('ステージング環境のデータベース移行を承認してください', 30)).toBe(2)
+  })
+
+  test('the pane asks for a row for each row a wrapped title takes, at the width it is drawn in', () => {
+    const view = {
+      shown: [INSTRUMENTS, XCODE_LONG],
+      selectedId: null,
+      editing: null,
+      draft: '',
+      nowMs: NOW,
+      sessionId: 'session-1',
+      isWorking: false,
+      canType: true,
+      isFocused: true,
+    }
+
+    // A title on one row would ask for 10 rows wherever it is drawn: the
+    // rows Claude Code 2.1.296 drew at 36 and 64 columns, as the live check reads them.
+    expect(rowsFor(view, 32, 99)).toBe(18)
+    expect(rowsFor(view, 60, 99)).toBe(12)
+    expect(rowsFor({ ...view, shown: [INSTRUMENTS] }, 32, 99)).toBe(14)
+    expect(rowsFor({ ...view, shown: [INSTRUMENTS] }, 60, 99)).toBe(10)
+    expect(rowsFor(view, 32, 18)).toBe(18)
+  })
+
+  test('drawn narrow, the pane opens again as tall as its wrapped titles', async ($, on) => {
+    const { world } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+
+    await runTasks($)
+    const ui = await $.ui.mount(inline(60))
+    expect(world.opens.at(-1)?.rows).toBe(12)
+
+    // The terminal narrows: the titles take more rows, and the pane asks for them.
+    await ui.redraw(inline(32).props)
+    expect(world.opens.at(-1)?.rows).toBe(18)
+  })
+
+  test('every open task shows its whole title, wrapping, with its age after it in the same text', async ($, on) => {
+    seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+
+    const ui = await $.ui.mount(inline(32))
+    const selected = await ui.find({ type: 'Text', text: /Open Instruments/ })
+    const other = await ui.find({ type: 'Text', text: /Run xcodebuild/ })
+
+    expect(selected?.props.wrap).toBe('wrap')
+    expect(selected?.text).toBe(`#1 ${INSTRUMENTS.title}  3m · from an earlier session`)
+    expect(other?.props.wrap).toBe('wrap')
+    expect(other?.text).toBe(` ${XCODE_LONG.title}  3m · from an earlier session`)
+    expect((await ui.find({ type: 'Button', key: 'select-2' }))?.props.label).toBe('#2')
+  })
+
+  test('a title past 80 characters, an older version left, is drawn whole', async ($, on) => {
+    const title = `Rotate the deploy key ${'and check every runner that holds it '.repeat(3).trim()}`
+    seat(on, earlier([{ ...INSTRUMENTS, title }, { ...XCODE_LONG, title, state: 'done', update: 'pending' }]))
+    await start($)
+
+    const ui = await $.ui.mount(inline(32))
+
+    expect(title.length).toBeGreaterThan(80)
+    expect(await textOf(ui, 'task-1')).toContain(title)
+    expect(await textOf(ui, 'saved-2')).toContain(`#2 ${title} · not sent yet`)
+  })
+
+  test('the transcript row keeps its label whole and wraps the title after it', async ($, on) => {
+    seat(on)
+    await start($)
+
+    const ui = await $.ui.mount({
+      plugin: 'human-in-the-loop',
+      surface: 'terminal',
+      component: 'ToolUse',
+      props: {
+        tool_use_id: 'toolu_1',
+        tool: ASSIGN,
+        input: { title: XCODE_LONG.title },
+        isRunning: false,
+        isErrored: false,
+        isInterrupted: false,
+      },
+    })
+    // One text, outermost: no row of columns for the label to be squeezed in.
+    const row = await ui.find({ type: 'Text' })
+
+    expect((await ui.drawn()).type).toBe('Text')
+    expect(row?.props.wrap).toBe('wrap')
+    expect(row?.text).toBe(`☐ Assigned you a task: ${XCODE_LONG.title}`)
   })
 })
 

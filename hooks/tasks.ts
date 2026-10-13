@@ -215,21 +215,6 @@ export function statusOf(shown: readonly Task[], elsewhere = 0): string | undefi
   return [...parts, '/my-tasks', others].filter(part => part !== '').join(' · ')
 }
 
-/**
- * The rows the My tasks pane asks for: a head, the selected task whole, a row
- * for every other task, and a hint; at most `max`.
- */
-export function rowsFor(shown: readonly Task[], selectedId: number | null, isEditing: boolean, max: number): number {
-  const open = shown.filter(isActive)
-  const selected = open.find(task => task.id === selectedId) ?? open[0]
-  const whole =
-    selected === undefined
-      ? 0
-      : 1 + Math.ceil(selected.why.length / 70) + (selected.doneWhen === undefined ? 0 : 1) + (isEditing ? 2 : 1)
-
-  return Math.min(max, 2 + whole + (open.length - (selected === undefined ? 0 : 1)) + (shown.length - open.length) + 1)
-}
-
 const BRIDGE = /^\s*↳?\s*Answer to #(\d+):[ \t]*\n?/i
 
 /** What a long answer written in the prompt box starts with. */

@@ -86,6 +86,8 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     composer: '',
     /** Set, the plugin's prompts don't enter: a hook beneath drops them with this reason. */
     refusing: undefined as string | undefined,
+    /** Set, the plugin's own rows don't enter the conversation: a hook beneath refuses them with this reason. */
+    refusingRows: undefined as string | undefined,
     sessionId: 'session-1',
     store: JSON.parse(JSON.stringify(store)) as Record<string, unknown>,
   }
@@ -144,11 +146,16 @@ function seat(on: On, store: Record<string, unknown> = {}) {
 
     return { text: e.text, ...(e.context === undefined ? {} : { context: e.context }) }
   })
-  on('session.append', ($, e) => {
+  on('session.append', ($, e, next) => {
+    // Only a plugin's own row may be refused; any other must go on with next.
+    if (e.door === 'note' && world.refusingRows !== undefined) {
+      return { deny: world.refusingRows }
+    }
+
     const block = e.message.content[0] as { text?: string } | undefined
     world.appended.push({ type: e.message.type, text: block?.text ?? '' })
 
-    return { message: e.message, uuid: e.uuid }
+    return next(e)
   })
   on('prompt.context', ($, e) => ({ blocks: e.blocks }))
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
@@ -354,7 +361,7 @@ describe('responding', () => {
     expect(next.context?.[0]).toContain('LoginTests.testExpiredToken failed')
   })
 
-  test('Send now while Claude works reaches it in the turn, or the moment the turn ends', async ($, on) => {
+  test('Send now while Claude works reaches it in the turn', async ($, on) => {
     const { world, clock } = seat(on)
     await start($)
 
@@ -368,9 +375,36 @@ describe('responding', () => {
     await clock.advance(1000)
     await clock.settle()
 
-    // The test kit has no conversation to append to, so the running turn
-    // refuses the row: the answer waits for the turn's end, not the next prompt.
+    expect(world.appended.map(row => row.type)).toEqual(['user', 'system'])
+    expect(world.appended[0]?.text).toContain('CartTests.testCouponRounding')
+    expect(world.appended[1]?.text).toBe('Sent your response to #1 to Claude')
+    expect(world.toasts).toHaveLength(0)
+
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    // Claude has the row already, so the answer doesn't go again; but no step
+    // read it before the turn ended, so a one-line prompt wakes Claude for it.
+    expect(world.submitted).toEqual(['I answered a task while you were finishing your reply; my answer is above.'])
+  })
+
+  test('Send now that the running turn refuses goes the moment the turn ends', async ($, on) => {
+    const { world, clock } = seat(on)
+    world.refusingRows = 'No conversation to append to.'
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer', text: 'CartTests.testCouponRounding', kind: 'change' })
+    await ui.press({ key: 'other-way' })
+    await clock.advance(1000)
+    await clock.settle()
+
     expect(world.toasts.at(-1)).toBe('Claude gets your response to #1 when it finishes this turn.')
+    expect(world.appended).toHaveLength(0)
     expect(world.submitted).toHaveLength(0)
 
     await $.turn.complete({ ...DONE, turnId: 't1' })

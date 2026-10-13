@@ -157,7 +157,7 @@ class Claude:
     def write_seed(self):
         path = self.store_file()
         seeded = self.seeded
-        # Write it until it stays: a session ending late may write its own over it.
+        # Write it until it stays: the session that made the file may still be ending.
         for _ in range(20):
             with open(path, 'w') as f:
                 json.dump(seeded, f)
@@ -169,18 +169,12 @@ class Claude:
 
     def pane(self, columns, rows, keys=()):
         """The screen with the pane opened by /my-tasks, after `keys`."""
-        for attempt in range(3):
-            self.start(columns, rows)
-            self.command('/my-tasks')
-            screen = wait_for(self.session, lambda s: ('╰' in s and 'for you' in s) or 'No tasks for you' in s)
-            if 'No tasks for you' not in screen:
-                break
-            # The seeding session's last write landed after the seed: seed again.
-            self.stop()
-            time.sleep(1.0)
-            self.write_seed()
-        else:
-            raise RuntimeError(f'the seeded tasks never reached the session:\n{screen}')
+        self.start(columns, rows)
+        # The session takes the tasks on as it starts; the status line counts
+        # them once it has. /my-tasks typed before that finds none.
+        wait_for(self.session, lambda s: 'human-in-the-loop: ☐' in s or 'human-in-the-loop: ✓' in s)
+        self.command('/my-tasks')
+        screen = wait_for(self.session, lambda s: '╰' in s and 'for you' in s)
         if keys:
             # The pane takes the keys when the prompt lets it; else ctrl+x tab hands them over.
             try:

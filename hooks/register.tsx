@@ -16,13 +16,35 @@ import {
   looksSecret,
   messageOf,
   parseAsk,
-  rowsFor,
   sameAsk,
   statusOf,
 } from './tasks'
+import {
+  ANSWER_LABEL,
+  BUTTON_GAP,
+  HELD,
+  HIDE,
+  MAX_SHOWN_TITLE,
+  REASON_LABEL,
+  REASON_PLACEHOLDER,
+  actionsOf as actionsFor,
+  ageOf,
+  answerButtonsOf,
+  answerPlaceholderOf,
+  doneWhenOf,
+  headlineOf,
+  hintOf,
+  nameOf,
+  rowsFor,
+  savedOf,
+  selectedOf,
+  titleOf,
+  whyOf,
+} from './pane'
+import type { PaneView } from './pane'
 import { HEARTBEAT_MS, adopt, elsewhereIn, endSlot, storedOf, takenFrom, withSlot } from './project'
 import type { Stored } from './project'
-import { ago, oneLine, plural, printable } from './text'
+import { oneLine, printable } from './text'
 
 const PLUGIN = 'human-in-the-loop'
 
@@ -166,6 +188,15 @@ const live = {
   turns: new Set<string>(),
   /** Whether a turn runs, in the engine's own word (the band's `isWorking`), once it has said. */
   engineWorking: undefined as boolean | undefined,
+  /**
+   * The pane's body as last drawn: its width, whether it draws a field and
+   * holds the keys; until it is first drawn, an 80-column terminal's.
+   */
+  columns: 76,
+  canType: true,
+  isFocused: false,
+  /** The rows the pane last asked for. */
+  rows: 0,
 }
 
 /** Whether Claude is at work: the engine's word when it has given one, else the turns begun and not ended. */
@@ -480,11 +511,12 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
 
     return (
-      <Box flexDirection="row">
+      // One text, so the label keeps its words whole and the title wraps after it.
+      <Text wrap="wrap">
         <Text color="yellow">{'☐ '}</Text>
         <Text bold>{'Assigned you a task: '}</Text>
-        <Text wrap="truncate-end">{printable(title, MAX_TITLE)}</Text>
-      </Box>
+        {printable(title, MAX_SHOWN_TITLE)}
+      </Text>
     )
   })
 
@@ -493,63 +525,72 @@ export const register: Register = on => {
     const { Box, Text, Button } = elements
     // The mobile app draws no field yet: answers and reasons wait for a surface that does.
     const Input = 'Input' in elements ? elements.Input : undefined
-    const shown = (await read($, tasks)).filter(isShown)
+    const view = await paneView($, { canType: Input !== undefined, isFocused: e.props.isFocused })
+
+    // The pane asks for the rows its tree takes at the width it is drawn in:
+    // a long title wraps, and a pane sized for one row would cut off the rest.
+    live.columns = e.props.bodyColumns
+    live.canType = view.canType
+    live.isFocused = view.isFocused
+
+    if (e.props.placement === 'inline' && rowsFor(view, live.columns, MAX_PANE_ROWS) !== live.rows) {
+      void fit($)
+    }
+
+    const { shown, editing: field, isWorking: working } = view
 
     if (shown.length === 0) {
       return <Text dimColor>No tasks for you right now.</Text>
     }
 
-    const chosen = await read($, selectedId)
-    const field = await read($, editing)
-    const working = await read($, isWorking)
-    const nowMs = await $.clock.now()
-    const canType = Input !== undefined
-
     const active = shown.filter(isActive)
     const saved = shown.filter(task => !isActive(task))
-    const selected = active.find(task => task.id === chosen) ?? active[0]
+    const selected = selectedOf(view)
+    const head = headlineOf(view)
 
-    const headline =
-      active.length > 0 ? `${plural(active.length, 'task')} for you` : `${plural(saved.length, 'response')} not sent yet`
-    const savedNote = active.length > 0 && saved.length > 0 ? ` · ${saved.length} not sent yet` : ''
+    // The glyph keeps its cells beside a title that wraps.
+    const glyph = (
+      <Box flexShrink={0}>
+        <Text color="yellow">{'☐ '}</Text>
+      </Box>
+    )
 
-    const glyph = <Text color="yellow">{'☐ '}</Text>
-    const earlier = (task: Task) => (task.sessionId === live.sessionId ? '' : ' · from an earlier session')
+    // The title and its age are one text, so a long title wraps under itself
+    // and the age follows it, never squeezed into a column of its own.
+    const titleText = (task: Task, isBold: boolean) => (
+      <Text wrap="wrap">
+        <Text bold={isBold}>{titleOf(task)}</Text>
+        <Text dimColor>{ageOf(task, view)}</Text>
+      </Text>
+    )
 
-    const actionsOf = (task: Task) => {
-      const choices =
-        task.kind === 'choose' && task.options !== undefined
-          ? task.options.map((option, i) => (
-              <Button
-                key={`option-${i + 1}`}
-                plain
-                hotkey={String(i + 1)}
-                label={printable(option, 60)}
-                onPress={() => resolve($, task.id, { state: 'done', answer: option }, 'auto')}
-              />
-            ))
-          : [<Button key="done" plain hotkey="d" label="Done" onPress={() => resolve($, task.id, { state: 'done' }, 'auto')} />]
+    const actionsOf = (task: Task) => (
+      <Box key="actions" flexDirection="row" flexWrap="wrap" columnGap={BUTTON_GAP}>
+        {actionsFor(task, view.canType).map(action => (
+          <Button
+            key={action.key}
+            plain
+            hotkey={action.hotkey}
+            label={action.label}
+            onPress={() => {
+              if (action.option !== undefined) {
+                return resolve($, task.id, { state: 'done', answer: action.option }, 'auto')
+              }
 
-      const typed = canType
-        ? [
-            <Button
-              key="answer"
-              plain
-              hotkey="r"
-              label={task.kind === 'choose' ? 'Other…' : 'Answer…'}
-              onPress={() => startEditing($, task.id, 'answer')}
-            />,
-            <Button key="reject" plain hotkey="x" label="Reject…" onPress={() => startEditing($, task.id, 'reason')} />,
-          ]
-        : [<Button key="reject" plain hotkey="x" label="Reject" onPress={() => resolve($, task.id, { state: 'rejected' }, 'auto')} />]
+              if (action.key === 'done') {
+                return resolve($, task.id, { state: 'done' }, 'auto')
+              }
 
-      return (
-        <Box key="actions" flexDirection="row" flexWrap="wrap" columnGap={3}>
-          {choices}
-          {typed}
-        </Box>
-      )
-    }
+              if (action.key === 'answer') {
+                return startEditing($, task.id, 'answer')
+              }
+
+              return view.canType ? startEditing($, task.id, 'reason') : resolve($, task.id, { state: 'rejected' }, 'auto')
+            }}
+          />
+        ))}
+      </Box>
+    )
 
     const answerField = (task: Task, held: string | undefined) => {
       if (Input === undefined) {
@@ -560,10 +601,9 @@ export const register: Register = on => {
         return (
           <Box key="held" flexDirection="column">
             <Text color="yellow" wrap="wrap">
-              This looks like a secret. Claude and the transcript on disk would see it. Put it where it belongs and press
-              Done instead.
+              {HELD}
             </Text>
-            <Box flexDirection="row" columnGap={3}>
+            <Box flexDirection="row" flexWrap="wrap" columnGap={BUTTON_GAP}>
               <Button key="edit" plain label="Edit" onPress={() => update($, editing, (): Editing => ({ id: task.id, field: 'answer' }))} />
               <Button key="send-anyway" plain label="Send anyway" onPress={() => answer($, task.id, held, 'auto', true)} />
             </Box>
@@ -571,18 +611,14 @@ export const register: Register = on => {
         )
       }
 
+      const [otherWay, long, cancel] = answerButtonsOf(view)
+
       return (
         <Box key="field" flexDirection="column">
           <Input
             key="answer"
-            label="Answer › "
-            placeholder={
-              !working
-                ? 'Enter sends it to Claude'
-                : active.length > 1
-                  ? 'Enter saves it; Claude gets it with your other answers'
-                  : 'Enter saves it; Claude gets it when this turn ends'
-            }
+            label={ANSWER_LABEL}
+            placeholder={answerPlaceholderOf(view)}
             value={live.drafts.get(task.id) ?? ''}
             submitLabel={working ? 'save' : 'send'}
             autoFocus
@@ -591,15 +627,15 @@ export const register: Register = on => {
             }}
             onSubmit={value => answer($, task.id, value, 'auto')}
           />
-          <Box flexDirection="row" columnGap={3}>
+          <Box flexDirection="row" flexWrap="wrap" columnGap={BUTTON_GAP}>
             <Button
               key="other-way"
               plain
-              label={working ? 'Send now' : 'Save for later'}
+              label={otherWay}
               onPress={() => answer($, task.id, live.drafts.get(task.id) ?? '', working ? 'now' : 'later')}
             />
-            <Button key="long" plain label="Long answer…" onPress={() => longAnswer($, task.id)} />
-            <Button key="cancel" plain label="Cancel" onPress={() => stopEditing($)} />
+            <Button key="long" plain label={long} onPress={() => longAnswer($, task.id)} />
+            <Button key="cancel" plain label={cancel} onPress={() => stopEditing($)} />
           </Box>
         </Box>
       )
@@ -614,8 +650,8 @@ export const register: Register = on => {
         <Box key="field" flexDirection="column">
           <Input
             key="reason"
-            label="Reason (optional) › "
-            placeholder="Enter rejects it"
+            label={REASON_LABEL}
+            placeholder={REASON_PLACEHOLDER}
             submitLabel="reject"
             autoFocus
             onSubmit={value => {
@@ -635,17 +671,21 @@ export const register: Register = on => {
         : field.field === 'answer'
           ? answerField(task, field.held)
           : reasonField(task)
+      const doneWhen = doneWhenOf(task)
 
       return (
-        <Box key={`task-${task.id}`} flexDirection="column">
+        <Box key={`task-${task.id}`} flexDirection="column" flexShrink={0}>
           <Box flexDirection="row">
             {glyph}
-            <Text bold wrap="truncate-end">{`#${task.id} ${printable(task.title, MAX_TITLE)}`}</Text>
-            <Text dimColor>{`  ${ago(nowMs - task.createdMs)}${earlier(task)}`}</Text>
+            {titleText(task, true)}
           </Box>
           <Box flexDirection="column" paddingLeft={2}>
-            <Text wrap="wrap">{printable(task.why, 300)}</Text>
-            {task.doneWhen === undefined ? null : <Text dimColor wrap="wrap">{`Done when: ${printable(task.doneWhen, 300)}`}</Text>}
+            <Text wrap="wrap">{whyOf(task)}</Text>
+            {doneWhen === undefined ? null : (
+              <Text dimColor wrap="wrap">
+                {doneWhen}
+              </Text>
+            )}
             {control}
           </Box>
         </Box>
@@ -656,44 +696,50 @@ export const register: Register = on => {
       task.id === selected?.id ? (
         selectedRows(task)
       ) : (
-        <Box key={`task-${task.id}`} flexDirection="row">
+        <Box key={`task-${task.id}`} flexDirection="row" flexShrink={0}>
           {glyph}
-          <Button
-            key={`select-${task.id}`}
-            plain
-            dimColor
-            label={`#${task.id} ${printable(task.title, MAX_TITLE)}`}
-            onPress={() => select($, task.id)}
-          />
-          <Text dimColor>{`  ${ago(nowMs - task.createdMs)}${earlier(task)}`}</Text>
+          <Box flexShrink={0}>
+            <Button key={`select-${task.id}`} plain dimColor label={`#${task.id}`} onPress={() => select($, task.id)} />
+          </Box>
+          <Text dimColor wrap="wrap">
+            {` ${nameOf(task)}${ageOf(task, view)}`}
+          </Text>
         </Box>
       ),
     )
 
     const savedRows = saved.map((task, i) => (
-      <Box key={`saved-${task.id}`} flexDirection="row">
-        {task.state === 'rejected' ? <Text color="red">{'✗ '}</Text> : <Text color="green">{'✓ '}</Text>}
-        <Text dimColor wrap="truncate-end">{`#${task.id} ${printable(task.title, 60)} · not sent yet  `}</Text>
-        <Button key={`send-${task.id}`} plain {...(i === 0 ? { hotkey: 's' } : {})} label="Send now" onPress={() => sendNow($)} />
+      <Box key={`saved-${task.id}`} flexDirection="row" flexShrink={0}>
+        <Box flexShrink={0}>{task.state === 'rejected' ? <Text color="red">{'✗ '}</Text> : <Text color="green">{'✓ '}</Text>}</Box>
+        <Text dimColor wrap="wrap">
+          {savedOf(task)}
+        </Text>
+        <Box flexShrink={0} marginLeft={2}>
+          <Button key={`send-${task.id}`} plain {...(i === 0 ? { hotkey: 's' } : {})} label="Send now" onPress={() => sendNow($)} />
+        </Box>
       </Box>
     ))
 
-    const hint = e.props.isFocused ? 'Esc: back to the prompt' : 'Click, or press ctrl+x tab to use the keys'
-
     return (
       <Box flexDirection="column">
-        <Box key="head" flexDirection="row">
-          <Text color={active.length > 0 ? 'yellow' : 'gray'}>{active.length > 0 ? '☐ ' : '✓ '}</Text>
-          <Text bold>{headline}</Text>
-          <Text dimColor>{savedNote}</Text>
+        <Box key="head" flexDirection="row" flexShrink={0}>
+          <Text wrap="wrap">
+            <Text color={active.length > 0 ? 'yellow' : 'gray'}>{head.glyph}</Text>
+            <Text bold>{head.headline}</Text>
+            <Text dimColor>{head.note}</Text>
+          </Text>
         </Box>
-        <Box key="tasks" flexDirection="column" marginTop={1}>
+        <Box key="tasks" flexDirection="column" marginTop={1} flexShrink={0}>
           {taskRows}
           {savedRows}
         </Box>
-        <Box key="foot" flexDirection="row" marginTop={1} columnGap={3}>
-          <Text dimColor>{hint}</Text>
-          <Button key="hide" plain dimColor role="dismiss" label="Hide" onPress={() => $.ui.close({ id: PANE })} />
+        <Box key="foot" flexDirection="row" marginTop={1} columnGap={BUTTON_GAP} flexShrink={0}>
+          <Text dimColor wrap="wrap">
+            {hintOf(view)}
+          </Text>
+          <Box flexShrink={0}>
+            <Button key="hide" plain dimColor role="dismiss" label={HIDE} onPress={() => $.ui.close({ id: PANE })} />
+          </Box>
         </Box>
       </Box>
     )
@@ -844,8 +890,8 @@ async function refresh($: EngineInterface): Promise<boolean> {
  * surface seated it: one opened unasked waits on a narrow terminal.
  */
 async function show($: EngineInterface, isAsked: boolean): Promise<boolean> {
-  const shown = (await read($, tasks)).filter(isShown)
-  const rows = rowsFor(shown, await read($, selectedId), (await read($, editing)) !== null, MAX_PANE_ROWS)
+  const rows = rowsFor(await paneView($, live), live.columns, MAX_PANE_ROWS)
+  live.rows = rows
   // The pane is a view of the tasks: one that can't open costs the user a
   // click on /my-tasks, never the task itself.
   const opened = await $.ui
@@ -853,6 +899,23 @@ async function show($: EngineInterface, isAsked: boolean): Promise<boolean> {
     .catch(() => ({ isPlaced: false as const }))
 
   return opened.isPlaced
+}
+
+/** What the pane draws from: the session's state, and what only the surface knows. */
+async function paneView($: EngineInterface, surface: Pick<PaneView, 'canType' | 'isFocused'>): Promise<PaneView> {
+  const field = await read($, editing)
+
+  return {
+    shown: (await read($, tasks)).filter(isShown),
+    selectedId: await read($, selectedId),
+    editing: field,
+    draft: field === null ? '' : (live.drafts.get(field.id) ?? ''),
+    nowMs: await $.clock.now(),
+    sessionId: live.sessionId,
+    isWorking: await read($, isWorking),
+    canType: surface.canType,
+    isFocused: surface.isFocused,
+  }
 }
 
 /** Re-sizes the pane to what it holds now, when it is on screen. */

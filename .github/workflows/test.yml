@@ -13,14 +13,15 @@ concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The engine the tests run against. Bump it on purpose, so a change in
+  # the test kit shows up as its own commit and not as a red PR.
+  CLAUDE_CODE_VERSION: 2.1.296
+
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      # The engine the tests run against. Bump it on purpose, so a change in
-      # the test kit shows up as its own commit and not as a red PR.
-      CLAUDE_CODE_VERSION: 2.1.296
     steps:
       - uses: actions/checkout@v4
 
@@ -36,3 +37,30 @@ jobs:
 
       - name: Run the tests
         run: claude plugin test .
+
+  # The test kit checks the tree the plugin draws, never how a terminal lays
+  # it out: this job draws the pane in a real Claude Code, in tmux, and reads
+  # the screen back. No model is called.
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LANG: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code and tmux
+        run: |
+          npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" typescript@6.0.2
+          sudo apt-get update -q && sudo apt-get install -yq tmux
+
+      - name: Draw the pane at narrow and wide widths
+        run: python3 tests/live/test_pane.py
+
+      # Loading the plugin laid its types in .claude-plugin/types.
+      - name: Type-check
+        run: tsc -p .

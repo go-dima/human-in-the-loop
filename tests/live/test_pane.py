@@ -34,6 +34,18 @@ TASKS = [
     {'id': 4, 'title': JAPANESE, 'why': 'The migration drops a column.', 'kind': 'choose', 'options': ['Approve', 'Wait for Monday']},
 ]
 
+DAY_MS = 86_400_000
+
+# Five tasks a day or more old, as a live session showed them on 0.1.4: the
+# other tasks' ages fell into a column one character wide.
+OLDER = [
+    {'id': 6, 'title': 'Review and merge PR #1591 (alerts read access for release agents)', 'why': 'It documents how anyone, including an agent, reads prod alerts during a release. Merging it is your call.', 'doneWhen': 'PR #1591 is merged or closed.', 'ageMs': DAY_MS},
+    {'id': 27, 'title': 'Update Slack Voice to 0.2.0 and retry /slack after a Claude Slack draft', 'why': 'w', 'ageMs': 5 * DAY_MS},
+    {'id': 28, 'title': 'Review the Mira in the Fiverr App plan, then share it', 'why': 'w', 'ageMs': 5 * DAY_MS},
+    {'id': 35, 'title': 'Review the supply-gaps method doc and draft workbook, then send to Shimon', 'why': 'w', 'ageMs': 5 * DAY_MS},
+    {'id': 36, 'title': 'Approve the staging migration', 'why': 'w', 'ageMs': 5 * DAY_MS},
+]
+
 SAVED = [
     {'id': 5, 'title': LONG, 'why': 'It leaked.', 'state': 'done', 'update': 'pending'},
 ]
@@ -87,6 +99,15 @@ class Pane(unittest.TestCase):
                     # A word longer than the row breaks where the row ends, nothing lost.
                     self.assertIn(f'#3{GERMAN}3m·fromanearliersession'.replace(' ', ''), text.replace(' ', ''), context)
                     self.assertIn(f'#4{JAPANESE}3m·fromanearliersession', text.replace(' ', ''), context)
+
+    def test_five_older_tasks_show_each_title_and_age_whole(self):
+        body, context = self.draw(OLDER, 66)
+        text = joined(body)
+
+        self.assert_fits(body, context)
+        self.assertIn(f"#6 {OLDER[0]['title']} 1d · from an earlier session", text, context)
+        for task in OLDER[1:]:
+            self.assertIn(f"#{task['id']} {task['title']} 5d · from an earlier session", text, context)
 
     def test_a_pane_taller_than_its_rows_scrolls_and_squeezes_nothing(self):
         body, context = self.draw(TASKS, 36)

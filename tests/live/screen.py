@@ -136,7 +136,15 @@ class Claude:
         now_ms = int(time.time() * 1000)
         slot = {
             'tasks': [
-                {'state': 'open', 'update': 'none', 'kind': 'do', 'sessionId': 'earlier', 'createdMs': now_ms - 180_000, 'updatedMs': now_ms - 180_000, **task}
+                {
+                    'state': 'open',
+                    'update': 'none',
+                    'kind': 'do',
+                    'sessionId': 'earlier',
+                    'createdMs': now_ms - task.get('ageMs', 180_000),
+                    'updatedMs': now_ms - task.get('ageMs', 180_000),
+                    **{k: v for k, v in task.items() if k != 'ageMs'},
+                }
                 for task in tasks
             ],
             'seenMs': now_ms - 600_000,

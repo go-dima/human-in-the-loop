@@ -90,6 +90,8 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     composer: '',
     /** Set, the plugin's prompts don't enter: a hook beneath drops them with this reason. */
     refusing: undefined as string | undefined,
+    /** Set, the user's typed prompts don't enter: a hook beneath (a settings hook, say) drops them with this reason. */
+    refusingTyped: undefined as string | undefined,
     /** Set, the plugin's own rows don't enter the conversation: a hook beneath refuses them with this reason. */
     refusingRows: undefined as string | undefined,
     sessionId: 'session-1',
@@ -147,6 +149,10 @@ function seat(on: On, store: Record<string, unknown> = {}) {
   on('prompt.submit', ($, e) => {
     if (e.origin.kind === 'plugin' && world.refusing !== undefined) {
       return { drop: world.refusing }
+    }
+
+    if (e.origin.kind === 'composer' && world.refusingTyped !== undefined) {
+      return { drop: world.refusingTyped }
     }
 
     if (e.origin.kind === 'plugin') {
@@ -507,6 +513,33 @@ describe('responding', () => {
     expect(next.context?.[0]).toContain('LoginTests.testExpiredToken failed')
   })
 
+  test('a saved answer riding a typed prompt that a hook beneath drops waits for the next one', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(KEY_TASK)
+    await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    await clock.advance(1000)
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    world.refusingTyped = 'Blocked by your organization.'
+    const blocked = await $.prompt.submit(typed('now the cart'))
+
+    expect(blocked.drop).toBe('Blocked by your organization.')
+    expect(world.status).toBe('☐ 1 task for you · 1 not sent yet · /my-tasks')
+
+    world.refusingTyped = undefined
+    const next = await $.prompt.submit(typed('now the cart'))
+
+    expect(next.context?.[0]).toContain('LoginTests.testExpiredToken failed')
+    expect(world.status).toBe('☐ 1 task for you · /my-tasks')
+  })
+
   test('Send now while Claude works reaches it in the turn', async ($, on) => {
     const { world, clock } = seat(on)
     await start($)
@@ -650,6 +683,18 @@ describe('long answers in the prompt box', () => {
     const sent = await $.prompt.submit(typed('↳ Answer to #1: LoginTests.testExpiredToken\nCartTests.testCouponRounding'))
 
     expect(sent.text).toContain('#1 Run xcodebuild test on your Mac, paste the failures:\nLoginTests.testExpiredToken\nCartTests.testCouponRounding')
+  })
+
+  test('typed while Claude is idle and dropped by a hook beneath, the answer is kept to send', async ($, on) => {
+    const { world } = seat(on)
+    world.refusingTyped = 'Blocked by your organization.'
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const blocked = await $.prompt.submit(typed('↳ Answer to #1: Two failures'))
+
+    expect(blocked.drop).toBe('Blocked by your organization.')
+    expect(world.status).toBe('✓ 1 not sent yet · /my-tasks')
   })
 
   test('typed while Claude works, it is saved instead of sent', async ($, on) => {

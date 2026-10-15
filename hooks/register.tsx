@@ -459,9 +459,8 @@ export const register: Register = on => {
       // update Claude has not heard.
       await resolve($, task.id, { state: 'done', ...given }, 'later')
       const due = (await read($, tasks)).filter(one => one.update === 'pending')
-      await delivered($, due.map(one => one.id))
 
-      return next({ ...e, text: messageOf(due) })
+      return passOn($, due, () => next({ ...e, text: messageOf(due) }))
     }
 
     const due = (await read($, tasks)).filter(one => one.update === 'pending')
@@ -470,9 +469,7 @@ export const register: Register = on => {
       return next(e)
     }
 
-    await delivered($, due.map(one => one.id))
-
-    return next({ ...e, context: [...(e.context ?? []), digestOf(due)] })
+    return passOn($, due, () => next({ ...e, context: [...(e.context ?? []), digestOf(due)] }))
   })
 
   // Read at a conversation's start and again after a compaction: what is
@@ -795,6 +792,14 @@ async function load($: EngineInterface) {
   await update($, nextId, n => Math.max(n, stored.nextId))
   await update($, loadedFor, () => live.sessionId)
   await writeStore($, found, withSlot(stored, live.sessionId, adopted, nowMs))
+
+  // A project's key is made as its first session joins, tasks or not, as
+  // it was before slots had keys of their own: the live render check finds
+  // the store's file by it.
+  const project = keysOf(live.root).project
+  if (!(await $.store.keys()).includes(project)) {
+    await $.store.set(project, { nextId: stored.nextId })
+  }
   live.elsewhere = elsewhereIn(stored, live.sessionId, nowMs)
   await reselect($)
 }
@@ -975,6 +980,30 @@ async function delivered($: EngineInterface, ids: readonly number[]) {
   }
 
   await change($, list => list.map(task => (ids.includes(task.id) ? { ...task, update: 'delivered' } : task)))
+}
+
+/**
+ * Passes on a typed prompt that carries `due` to Claude. They are marked
+ * delivered first, so no other path sends them meanwhile; a prompt a hook
+ * beneath drops, or that fails, gives them back, to go with the next send.
+ */
+async function passOn<R extends { drop?: unknown }>($: EngineInterface, due: readonly Task[], pass: () => Promise<R>): Promise<R> {
+  const ids = due.map(one => one.id)
+
+  await delivered($, ids)
+
+  try {
+    const result = await pass()
+
+    if (result.drop !== undefined) {
+      await undelivered($, ids)
+    }
+
+    return result
+  } catch (error) {
+    await undelivered($, ids)
+    throw error
+  }
 }
 
 /** Gives back updates marked delivered that never reached Claude: they wait again. */

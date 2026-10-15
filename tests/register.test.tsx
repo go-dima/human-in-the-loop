@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 
 import { rowsFor } from '../hooks/pane'
+import { keysOf, storedFrom } from '../hooks/project'
 import { cellsOf, rowsOf, wrapRows } from '../hooks/text'
 
 const ASSIGN = 'mcp__human-in-the-loop__assign_task'
@@ -93,12 +94,17 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     refusingRows: undefined as string | undefined,
     sessionId: 'session-1',
     store: JSON.parse(JSON.stringify(store)) as Record<string, unknown>,
+    /** Set, runs once just before the plugin's next store write: another session's write landing meanwhile. */
+    landing: undefined as (() => void) | undefined,
   }
 
   const clock = mock.clock(on, { now: NOW })
   // The plugin's own store, kept where a test can read it.
   on('store.get', ($, e) => ({ value: world.store[e.key] }))
   on('store.set', ($, e) => {
+    const landing = world.landing
+    world.landing = undefined
+    landing?.()
     world.store[e.key] = JSON.parse(JSON.stringify(e.value))
     return { value: undefined }
   })
@@ -691,6 +697,13 @@ describe('the system prompt', () => {
 })
 
 describe('across sessions', () => {
+  const KEYS = keysOf('/repo')
+
+  /** The project as the store holds it, across its keys. */
+  function projectIn(store: Record<string, unknown>) {
+    return storedFrom('/repo', store) as { nextId: number; sessions: Record<string, { tasks: { id: number }[]; seenMs: number; endedMs?: number }>; taken: Record<string, unknown> }
+  }
+
   test("the first store layout's open tasks come back in the next session, and Claude is told", async ($, on) => {
     const { world } = seat(on, {
       'tasks:/repo': {
@@ -741,9 +754,31 @@ describe('across sessions', () => {
     expect(String((assigned as { result?: unknown }).result)).toContain('Assigned task #8')
     expect(world.status).toBe('☐ 1 task for you · /my-tasks · 1 task in another session')
 
-    const stored = world.store['tasks:/repo'] as { sessions: Record<string, { tasks: { id: number }[] }> }
+    const stored = projectIn(world.store)
     expect(stored.sessions['session-0']?.tasks.map(task => task.id)).toEqual([7])
     expect(stored.sessions['session-1']?.tasks.map(task => task.id)).toEqual([8])
+    // The older layout's slots moved to keys of their own; the project's key keeps the count.
+    expect(world.store['tasks:/repo']).toEqual({ nextId: 9 })
+    expect(world.store[KEYS.session('session-0')]).toEqual({ tasks: [ROTATE], seenMs: NOW - 30_000 })
+  })
+
+  test("another session's write landing between this one's read and write stays", async ($, on) => {
+    const { world, clock } = seat(on, { [KEYS.session('session-0')]: { tasks: [ROTATE], seenMs: NOW - 30_000 } })
+    await start($)
+    await $.tool.call(KEY_TASK)
+
+    // Session 0 saves an answer while this session's heartbeat is between its read and its write.
+    const answered = { ...ROTATE, state: 'done', update: 'pending' }
+    world.landing = () => {
+      world.store[KEYS.session('session-0')] = { tasks: [answered], seenMs: NOW + 30_000 }
+    }
+    await clock.advance(60_000)
+    await clock.settle()
+
+    expect(world.landing).toBeUndefined()
+    const stored = projectIn(world.store)
+    expect(stored.sessions['session-0']).toEqual({ tasks: [answered], seenMs: NOW + 30_000 })
+    expect(stored.sessions['session-1']?.seenMs).toBe(NOW + 60_000)
   })
 
   test("an ended session's tasks, and a quiet one's, are taken on by the next session", async ($, on) => {
@@ -763,7 +798,7 @@ describe('across sessions', () => {
     expect(await textOf(ui, 'task-7')).toContain('from an earlier session')
 
     // The quiet one may come back (a laptop asleep): the store notes what it lets go of then.
-    const stored = world.store['tasks:/repo'] as { sessions: Record<string, unknown>; taken: Record<string, unknown> }
+    const stored = projectIn(world.store)
     expect(Object.keys(stored.sessions)).toEqual(['session-1'])
     expect(stored.taken).toEqual({ 'session-x': { ids: [8], atMs: NOW } })
   })
@@ -794,11 +829,11 @@ describe('across sessions', () => {
 
   /** The store as another session leaves it on taking on session-1's tasks while session-1 slept. */
   function takeOn(store: Record<string, unknown>) {
-    const project = store['tasks:/repo'] as { sessions: Record<string, { tasks: { id: number }[] }>; taken: Record<string, unknown> }
-    const mine = project.sessions['session-1']?.tasks ?? []
+    const mine = projectIn(store).sessions['session-1']?.tasks ?? []
 
-    project.sessions = { 'session-2': { tasks: mine, seenMs: NOW } as never }
-    project.taken = { 'session-1': { ids: mine.map(task => task.id), atMs: NOW } }
+    delete store[KEYS.session('session-1')]
+    store[KEYS.session('session-2')] = { tasks: mine, seenMs: NOW }
+    store[KEYS.taken('session-1')] = { ids: mine.map(task => task.id), atMs: NOW }
   }
 
   test('a session back from sleep lets go of the tasks another session took on meanwhile', async ($, on) => {
@@ -815,7 +850,7 @@ describe('across sessions', () => {
     expect(world.status).toBe('2 tasks in another session')
     expect(world.isPaneOpen).toBe(false)
 
-    const stored = world.store['tasks:/repo'] as { sessions: Record<string, { tasks: { id: number }[] }>; taken: Record<string, unknown> }
+    const stored = projectIn(world.store)
     expect(Object.keys(stored.sessions)).toEqual(['session-2'])
     expect(stored.sessions['session-2']?.tasks.map(task => task.id)).toEqual([1, 2])
     expect(stored.taken).toEqual({})
@@ -832,7 +867,7 @@ describe('across sessions', () => {
     expect(String((assigned as { result?: unknown }).result)).toContain('Assigned task #2')
     expect(world.toasts.at(-1)).toBe('Another session in this project took on task #1 while this one was away. Answer it there.')
 
-    const stored = world.store['tasks:/repo'] as { sessions: Record<string, { tasks: { id: number }[] }> }
+    const stored = projectIn(world.store)
     expect(stored.sessions['session-1']?.tasks.map(task => task.id)).toEqual([2])
     expect(stored.sessions['session-2']?.tasks.map(task => task.id)).toEqual([1])
   })
@@ -842,12 +877,11 @@ describe('across sessions', () => {
     await start($)
 
     await $.tool.call(KEY_TASK)
-    const project = world.store['tasks:/repo'] as { sessions: Record<string, unknown> }
-    project.sessions['session-0'] = { tasks: [ROTATE], seenMs: NOW }
+    world.store[KEYS.session('session-0')] = { tasks: [ROTATE], seenMs: NOW }
     await clock.advance(60_000)
     await clock.settle()
 
-    const stored = world.store['tasks:/repo'] as { sessions: Record<string, { seenMs: number }> }
+    const stored = projectIn(world.store)
     expect(stored.sessions['session-1']?.seenMs).toBe(NOW + 60_000)
     expect(world.status).toBe('☐ 1 task for you · /my-tasks · 1 task in another session')
   })
@@ -859,7 +893,7 @@ describe('across sessions', () => {
     await $.tool.call(KEY_TASK)
     await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-1', resume: { id: 'session-1' } })
 
-    const ended = world.store['tasks:/repo'] as { sessions: Record<string, { endedMs?: number }> }
+    const ended = projectIn(world.store)
     expect(ended.sessions['session-1']?.endedMs).toBe(NOW)
 
     world.sessionId = 'session-2'
@@ -870,7 +904,7 @@ describe('across sessions', () => {
     const ui = await $.ui.mount(PANE)
     expect(await textOf(ui, 'task-1')).toContain('from an earlier session')
 
-    const cleared = world.store['tasks:/repo'] as { sessions: Record<string, unknown> }
+    const cleared = projectIn(world.store)
     expect(Object.keys(cleared.sessions)).toEqual(['session-2'])
   })
 })

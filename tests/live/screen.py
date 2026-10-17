@@ -6,6 +6,7 @@ seeded with tasks an ended session left, `/my-tasks`, and `tmux capture-pane`
 at the width asked for. No model is called, so a dummy API key does.
 """
 
+import hashlib
 import json
 import re
 import os
@@ -105,7 +106,7 @@ class Claude:
     def stop(self):
         pid = run('tmux', 'display-message', '-p', '-t', self.session, '#{pane_pid}', check=False).stdout.strip()
         run('tmux', 'kill-session', '-t', self.session, check=False)
-        # Claude Code writes the store as it ends: wait it out, or it writes over the seed.
+        # Claude Code writes the store as it ends: wait it out before the folder goes.
         deadline = time.time() + 15
         while pid.isdigit() and time.time() < deadline:
             try:
@@ -115,24 +116,12 @@ class Claude:
             time.sleep(0.1)
 
     def store_file(self):
-        folder = os.path.join(self.config, 'plugins', 'store')
-        for name in os.listdir(folder) if os.path.isdir(folder) else []:
-            if name.startswith('human-in-the-loop'):
-                return os.path.join(folder, name)
-        return None
+        """The plugin's store, as the engine names it for a plugin loaded with --plugin-dir."""
+        digest = hashlib.sha256(b'human-in-the-loop@inline').hexdigest()[:12]
+        return os.path.join(self.config, 'plugins', 'store', f'human-in-the-loop_inline-{digest}.json')
 
     def seed(self, tasks):
         """Leaves `tasks` in the store as an ended session's, for the next one to take on."""
-        # The store's file is named by the engine: one session makes it.
-        self.start(80, 30)
-        self.command('/my-tasks')
-        deadline = time.time() + 15
-        while self.store_file() is None and time.time() < deadline:
-            time.sleep(0.25)
-        self.stop()
-        path = self.store_file()
-        if path is None:
-            raise RuntimeError('the plugin made no store; did it load?')
         now_ms = int(time.time() * 1000)
         slot = {
             'tasks': [
@@ -149,30 +138,27 @@ class Claude:
             ],
             'seenMs': now_ms - 600_000,
             'endedMs': now_ms - 600_000,
+            'nextId': max(task['id'] for task in tasks) + 1,
         }
-        next_id = max(task['id'] for task in tasks) + 1
-        self.seeded = {f'tasks:{self.project}': {'nextId': next_id, 'sessions': {'earlier': slot}, 'taken': {}}}
-        self.write_seed()
-
-    def write_seed(self):
         path = self.store_file()
-        seeded = self.seeded
-        # Write it until it stays: the session that made the file may still be ending.
-        for _ in range(20):
-            with open(path, 'w') as f:
-                json.dump(seeded, f)
-            time.sleep(0.5)
-            with open(path) as f:
-                if json.load(f) == seeded:
-                    return
-        raise RuntimeError('the seeded store kept being written over')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # The ended session's slot, under its own key; no session runs yet to write over it.
+        with open(path, 'w') as f:
+            json.dump({f'tasks:{self.project}#session:earlier': slot}, f)
 
     def pane(self, columns, rows, keys=()):
         """The screen with the pane opened by /my-tasks, after `keys`."""
         self.start(columns, rows)
         # The session takes the tasks on as it starts; the status line counts
         # them once it has. /my-tasks typed before that finds none.
-        wait_for(self.session, lambda s: 'human-in-the-loop: ☐' in s or 'human-in-the-loop: ✓' in s)
+        try:
+            wait_for(self.session, lambda s: 'human-in-the-loop: ☐' in s or 'human-in-the-loop: ✓' in s)
+        except TimeoutError as error:
+            # The engine names the store's file; the seed goes where store_file() says it does.
+            raise RuntimeError(
+                f'the session took on none of the tasks seeded in {self.store_file()}: '
+                'if the engine names a --plugin-dir store otherwise now, store_file() must follow'
+            ) from error
         self.command('/my-tasks')
         screen = wait_for(self.session, lambda s: '╰' in s and 'for you' in s)
         if keys:

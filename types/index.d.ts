@@ -38,6 +38,19 @@ export type Task = {
 }
 
 /**
+ * A task as the session that held it numbered it, and when it was assigned:
+ * where two sessions drew one number, that tells their tasks apart.
+ */
+export type TaskRef = { id: number; createdMs: number }
+
+/**
+ * The tasks one session took on from another that had ended or gone quiet,
+ * as that session numbered them, and when. `isEnded`: it had ended, so it
+ * won't come back for them.
+ */
+export type Took = { tasks: readonly TaskRef[]; atMs: number; isEnded?: boolean }
+
+/**
  * The selected task's field, when the pane shows one in place of its
  * buttons: an answer, or a reason for rejecting. `held` is an answer held
  * back because it looks like a secret.
@@ -53,6 +66,8 @@ declare module 'claude-code' {
     'human-in-the-loop': {
       tasks: readonly Task[]
       nextId: number
+      /** The tasks this session took on from others, by their session id. */
+      took: Readonly<Record<string, Took>>
       selectedId: number | null
       editing: Editing | null
       loadedFor: string | null

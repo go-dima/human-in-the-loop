@@ -50,7 +50,7 @@ export type Project = {
 /** A change to 0.1.4's value: slots taken out, notes left for their quiet sessions, and this session's note read. */
 export type LegacyEdit = { removed: string[]; taken: Record<string, Note>; read?: string }
 
-/** The store's longest key. */
+/** The store's longest key, in UTF-16 code units: the engine checks a key's `length`. */
 const MAX_KEY = 256
 
 /** Room kept in a session's key for its id, which is a UUID (36 characters). */
@@ -358,7 +358,12 @@ function dropLegacyCopy(project: Project, id: string, legacy: LegacyEdit) {
 export type Adoption = {
   /** Its own tasks (a resumed session) and those of sessions that ended or went quiet. */
   adopted: Task[]
-  /** Its notes of what it took: each kept in its slot, so a crash anywhere after leaves no task twice. */
+  /**
+   * Its notes of what it took: each kept in its slot, so a crash anywhere
+   * after leaves no task twice. Until that write lands, a session it took
+   * from that comes back keeps the tasks too, and lets them go once it reads
+   * the note.
+   */
   took: Record<string, Took>
   nextId: number
   /** This version's slots to remove once its own is written: ended, or holding nothing. */
@@ -377,8 +382,9 @@ export type Adoption = {
  * Two sessions assigning at the same moment can draw one number (the store
  * has no way to reserve one): where their tasks meet here, the session's own
  * keep theirs, the numbers its Claude knows, and a later one gets a new one.
- * So does one with a number in `known`: the session's own tasks that it is
- * done with, in no slot.
+ * So does one with a number in `known`, the session's own tasks that it is
+ * done with, in no slot, or in a 0.1.4 note of tasks taken from it: a copy
+ * of that note a 0.1.4 session's write puts back would take it again.
  *
  * A session taking the project on as it ends (`isEnding`) takes nothing from
  * a quiet one, which may come back: the next session to start takes it on.
@@ -390,6 +396,8 @@ export function adopt(project: Project, sessionId: string, nowMs: number, known:
   const took: Record<string, Took> = {}
   const removed: string[] = []
   const legacy = ownLegacy(project, sessionId)
+  // A 0.1.4 note's numbers were drawn from the project's count: a new number is past them.
+  const drawn = [...known, ...(project.legacy.taken[sessionId]?.ids ?? [])]
   let nextId = Math.max(floorOf(project), ...known.map(id => id + 1))
 
   for (const id of ids) {
@@ -402,7 +410,7 @@ export function adopt(project: Project, sessionId: string, nowMs: number, known:
     const held = heldIn(project, id, slot)
 
     for (const task of held) {
-      const isDrawn = adopted.some(one => one.id === task.id) || known.includes(task.id)
+      const isDrawn = adopted.some(one => one.id === task.id) || drawn.includes(task.id)
       adopted.push(isDrawn ? { ...task, id: nextId++ } : task)
     }
 
@@ -476,7 +484,10 @@ export function prune(
     }
 
     if (slot === undefined) {
-      // A quiet session may come back with its tasks in memory: the note waits for it.
+      // A quiet session may come back with its tasks in memory: the note
+      // waits for it. Once its slot is gone, nothing tells whether it ended
+      // since: a process that goes on after /clear takes on what it held,
+      // but for what a note names.
       if (note.isEnded !== true && !isExpired) {
         keep(id, note)
       }

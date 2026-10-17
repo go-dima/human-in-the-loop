@@ -61,7 +61,7 @@ import {
   withSlots,
 } from './project'
 import type { Adoption, LegacyEdit, Project, Slot } from './project'
-import { oneLine, printable } from './text'
+import { numbersOf, oneLine, printable } from './text'
 
 const PLUGIN = 'human-in-the-loop'
 
@@ -845,20 +845,24 @@ async function join($: EngineInterface) {
   // After /clear the process goes on as a new session, with no slot yet: it
   // takes over once the old session's writes are done, and takes on what
   // the old one held, ended whether or not its end write landed (or, when
-  // the old one never read the project, what the one before it held). What
-  // it holds for another folder's project waits in that folder's store, and
-  // it starts on this one as a new process would. A store that fails now
+  // the old one never read the project, what the one before it held).
+  // Resumed in another folder, it leaves that folder's tasks as its last
+  // write there left them and starts on this one as a new process would,
+  // keeping nothing it tracked of that project. A store that fails now
   // takes nothing on yet: the session writes nothing until it has read the
   // project, which the heartbeat tries again.
   const joined = queued(async () => {
     if (live.root !== '' && live.root !== root) {
       await update($, tasks, () => [])
       await update($, nextId, () => 1)
+      await update($, took, () => ({}))
+      await update($, selectedId, () => null)
       await update($, editing, () => null)
       await update($, loadedFor, () => null)
       live.drafts.clear()
       live.elsewhere = 0
-      live.floor = 0
+      live.floor = 1
+      live.hasLegacyPeer = false
     }
 
     live.sessionId = sessionId
@@ -930,9 +934,14 @@ async function load($: EngineInterface) {
   live.hasLegacyPeer = hasLegacyPeer(project, live.sessionId, nowMs)
   await reselect($)
 
-  // The slot first, noting what it took: only then do the slots it took from leave.
-  await writeOwn($, adoption.removed.length > 0)
-  await clean($, project, adoption.removed, adoption.legacy)
+  try {
+    // The slot first, noting what it took: only then do the slots it took from leave.
+    await writeOwn($, adoption.removed.length > 0)
+    await clean($, project, adoption.removed, adoption.legacy)
+  } catch {
+    // What it took on stands, and the caller shows it: the next heartbeat
+    // makes the writes.
+  }
 }
 
 /**
@@ -1078,7 +1087,7 @@ async function letGo($: EngineInterface, project: Project): Promise<boolean> {
   }
 
   if (lost.length > 0) {
-    const which = lost.map(task => `#${task.id}`).join(', ')
+    const which = numbersOf(lost.map(task => task.id))
     const [noun, them] = lost.length === 1 ? ['task', 'it'] : ['tasks', 'them']
 
     $.ui.toast(`Another session in this project took on ${noun} ${which} while this one was away. Answer ${them} there.`, {
@@ -1417,7 +1426,7 @@ async function giveBack($: EngineInterface, ids: readonly number[], note: DropNo
     return
   }
 
-  const which = ids.map(id => `#${id}`).join(', ')
+  const which = numbersOf(ids)
   const why = note === 'why' && reason !== undefined ? `: ${printable(reason, 200).replace(/[.!]+$/, '')}` : ''
 
   $.ui.toast(`Claude didn't get your response to ${which}${why}. It's saved; press Send now in /my-tasks.`, {
@@ -1538,7 +1547,7 @@ async function send($: EngineInterface, isTurnOver = false) {
 
   const text = messageOf(due)
   const ids = due.map(task => task.id)
-  const which = ids.map(id => `#${id}`).join(', ')
+  const which = numbersOf(ids)
 
   if (isTurnOver || !working()) {
     await passOn($, due, inWords, 'why', () => $.prompt.submit({ text, asUser: true })).catch(() => undefined)

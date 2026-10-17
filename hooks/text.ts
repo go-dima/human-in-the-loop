@@ -23,6 +23,11 @@ export function plural(count: number, word: string): string {
   return `${count} ${word}${count === 1 ? '' : 's'}`
 }
 
+/** `#3, #5`: task numbers as a toast or a notice names them. */
+export function numbersOf(ids: readonly number[]): string {
+  return ids.map(id => `#${id}`).join(', ')
+}
+
 /** `now`, `4m`, `3h`, `2d`: how long ago, at a glance. */
 export function ago(ms: number): string {
   const minutes = Math.floor(Math.max(0, ms) / 60_000)

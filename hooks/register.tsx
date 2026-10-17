@@ -52,7 +52,6 @@ import {
   floorOf,
   hasLegacyPeer,
   isEmptyEdit,
-  isGone,
   isSlot,
   isTakenFrom,
   keysOf,
@@ -197,6 +196,13 @@ type DropNote = 'why' | 'kept' | 'nothing'
 
 /** A prompt as it entered: its words, and the blocks that go beside them. */
 type Entered = { text: string; context?: readonly string[] }
+
+/**
+ * What a sync changed of what the session shows: nothing (`same`), the tasks
+ * another session took on (`lost`), or everything, taking the project on
+ * (`joined`).
+ */
+type Synced = 'same' | 'lost' | 'joined'
 
 /** What the module tracks beside `$.state`; a hot reload starts it over. */
 const live = {
@@ -904,12 +910,15 @@ async function load($: EngineInterface) {
 
   // Taken on against the task list as it stands when it changes hands, so a
   // press meanwhile is kept. `update` runs this again when another write
-  // beat it: the last run is the list it wrote.
+  // beat it: the last run is the list it wrote. The session's own tasks it
+  // is done with, which no slot holds, stay in it, with the numbers its
+  // Claude knows them by.
   await update($, tasks, current => {
+    const done = current.filter(task => task.sessionId === live.sessionId && !isShown(task))
     project = withHeld(stored, holder, slotFrom(current, notes, count, nowMs), nowMs)
-    adoption = adopt(project, live.sessionId, nowMs)
+    adoption = adopt(project, live.sessionId, nowMs, done.map(task => task.id), live.endedMs !== undefined)
 
-    return adoption.adopted
+    return [...done, ...adoption.adopted].sort((a, b) => a.id - b.id)
   })
 
   live.readMs = nowMs
@@ -941,11 +950,11 @@ async function isLoaded($: EngineInterface): Promise<boolean> {
  * /clear or a resume in place), it is that session's slot, ended: its end
  * write may have failed. The slot keeps the time the store has, so that it
  * leaves once this session's is written. Held for none (no session of the
- * process has read the project), it is the tasks its sessions assigned, each
- * beside those the store holds for the session that assigned it, which has
- * ended unless it is this one or the store says otherwise: alive, another
- * process has resumed it since, and this one holds them; quiet, it may come
- * back, and lets them go then.
+ * process has read the project), it is the tasks its sessions assigned: each
+ * session's beside the tasks the store holds for it, ended, unless it is this
+ * one or the store doesn't show it ended. One alive or quiet there has been
+ * resumed by another process since, or may have been: it keeps its slot, and
+ * what it assigned here goes on in this one's.
  */
 function withHeld(project: Project, holder: string | null, slot: Slot, nowMs: number): Project {
   if (holder !== null) {
@@ -963,11 +972,8 @@ function withHeld(project: Project, holder: string | null, slot: Slot, nowMs: nu
 
   for (const task of slot.tasks) {
     const stored = project.all[task.sessionId]
-    // A session of the process that another has resumed since keeps its
-    // slot, which this process never wrote: what it held goes on in this
-    // one's. A quiet one may come back: it ends only as the store says.
-    const id = stored === undefined || isGone(stored, nowMs) ? task.sessionId : own
-    const into = (slots[id] ??= { seenMs: 0, ...project.all[id], tasks: [], ...(id === own || id in project.all ? {} : { endedMs: nowMs }) })
+    const id = stored === undefined || stored.endedMs !== undefined ? task.sessionId : own
+    const into = (slots[id] ??= { seenMs: 0, ...project.all[id], tasks: [], ...(id === own ? {} : { endedMs: nowMs }) })
 
     into.tasks.push(task)
   }
@@ -992,10 +998,12 @@ async function beat($: EngineInterface, isWriting = true) {
 
   const was = live.elsewhere
   const synced = queued(() => sync($, isWriting))
-    .catch(() => false)
-    .then(async isLost => {
-      if (isLost || live.elsewhere !== was) {
-        await refresh($)
+    .catch((): Synced => 'same')
+    .then(async change => {
+      // A first read shows the project as joining does: the pane opens for
+      // the tasks it took on.
+      if ((change !== 'same' || live.elsewhere !== was) && (await refresh($)) && change === 'joined') {
+        await show($, false)
       }
     })
 
@@ -1008,12 +1016,12 @@ async function beat($: EngineInterface, isWriting = true) {
  * are still needed, counts the tasks waiting elsewhere, and writes the slot,
  * unless not `isWriting` (a write follows) and nothing leaves the store. A
  * session that couldn't read the project as it joined takes it on instead.
- * Resolves whether what it shows changed.
+ * Resolves what changed of what it shows.
  */
-async function sync($: EngineInterface, isWriting = true): Promise<boolean> {
+async function sync($: EngineInterface, isWriting = true): Promise<Synced> {
   if (!(await isLoaded($))) {
     await load($)
-    return true
+    return 'joined'
   }
 
   const nowMs = await $.clock.now()
@@ -1045,7 +1053,7 @@ async function sync($: EngineInterface, isWriting = true): Promise<boolean> {
     // heartbeat makes the writes.
   }
 
-  return isLost
+  return isLost ? 'lost' : 'same'
 }
 
 /**

@@ -377,27 +377,33 @@ export type Adoption = {
  * Two sessions assigning at the same moment can draw one number (the store
  * has no way to reserve one): where their tasks meet here, the session's own
  * keep theirs, the numbers its Claude knows, and a later one gets a new one.
+ * So does one with a number in `known`: the session's own tasks that it is
+ * done with, in no slot.
+ *
+ * A session taking the project on as it ends (`isEnding`) takes nothing from
+ * a quiet one, which may come back: the next session to start takes it on.
  */
-export function adopt(project: Project, sessionId: string, nowMs: number): Adoption {
+export function adopt(project: Project, sessionId: string, nowMs: number, known: readonly number[] = [], isEnding = false): Adoption {
   const all = project.all
   const ids = Object.keys(all).sort((a, b) => Number(b === sessionId) - Number(a === sessionId))
   const adopted: Task[] = []
   const took: Record<string, Took> = {}
   const removed: string[] = []
   const legacy = ownLegacy(project, sessionId)
-  let nextId = floorOf(project)
+  let nextId = Math.max(floorOf(project), ...known.map(id => id + 1))
 
   for (const id of ids) {
     const slot = all[id]!
 
-    if (id !== sessionId && !isGone(slot, nowMs)) {
+    if (id !== sessionId && (!isGone(slot, nowMs) || (isEnding && slot.endedMs === undefined))) {
       continue
     }
 
     const held = heldIn(project, id, slot)
 
     for (const task of held) {
-      adopted.push(adopted.some(one => one.id === task.id) ? { ...task, id: nextId++ } : task)
+      const isDrawn = adopted.some(one => one.id === task.id) || known.includes(task.id)
+      adopted.push(isDrawn ? { ...task, id: nextId++ } : task)
     }
 
     if (id === sessionId) {

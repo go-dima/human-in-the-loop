@@ -1293,6 +1293,44 @@ describe('across sessions', () => {
     expect(world.status).toBe('☐ 2 tasks for you · /my-tasks')
   })
 
+  test('a session that reads the project late keeps the tasks it was done with, and no task it takes on gets their numbers', async ($, on) => {
+    const { world, clock } = seat(on, {
+      [KEYS.session('session-0')]: { tasks: [{ ...ROTATE, id: 2 }], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 3 },
+    })
+    world.isStoreFailing = true
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(PAGING_TASK)
+    await $.tool.call({ tool: WITHDRAW, id: 2, reason: 'Ran it in CI' })
+    await $.tool.call({ tool: WITHDRAW, id: 3, reason: 'Went with cursor' })
+    world.isStoreFailing = false
+    await clock.advance(60_000)
+    await clock.settle()
+
+    for (const [id, title] of [[2, XCODE_TASK.title], [3, PAGING_TASK.title], [4, ROTATE.title]] as const) {
+      const listed = await $.tool.call({ tool: LIST, id })
+      expect(String((listed as { result?: unknown }).result)).toContain(title)
+    }
+  })
+
+  test('a store that fails as the session starts: once the heartbeat reads the project, the pane opens for what it took on', async ($, on) => {
+    const { world, clock } = seat(on, {
+      [KEYS.session('session-0')]: { tasks: [ROTATE], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 8 },
+    })
+    world.isStoreFailing = true
+    await start($)
+
+    world.isStoreFailing = false
+    await clock.advance(60_000)
+    await clock.settle()
+
+    expect(world.status).toBe('☐ 1 task for you · /my-tasks')
+    expect(world.opens.at(-1)?.id).toBe('my-tasks')
+    expect(world.opens.at(-1)?.focus).toBeUndefined()
+  })
+
   test('a resumed session keeps its notes of what it took', async ($, on) => {
     const quiet = { ...ROTATE, id: 8, title: 'Approve the staging migration', sessionId: 'session-x' }
     const note = { tasks: [refOf(quiet)], atMs: NOW - 10 * 60_000 }
@@ -1912,6 +1950,21 @@ describe('across sessions', () => {
     expect(Object.values(slotsIn(world.store)).flatMap(slot => slot.tasks)).toEqual([])
   })
 
+  test('a session that reads the project only as it ends takes nothing from a quiet session, which may come back', async ($, on) => {
+    const quiet = { tasks: [{ ...ROTATE, sessionId: 'session-q' }], seenMs: NOW - 10 * 60_000, nextId: 8 }
+    const { world } = seat(on, { [KEYS.session('session-q')]: quiet })
+    world.isStoreFailing = true
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    world.isStoreFailing = false
+    await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-1', resume: { id: 'session-1' } })
+
+    expect(slotsIn(world.store)['session-q']).toEqual(quiet)
+    expect(slotsIn(world.store)['session-1']?.tasks.map(task => task.title)).toEqual([KEY_TASK.title])
+    expect(slotsIn(world.store)['session-1']?.took).toBeUndefined()
+  })
+
   test('after /clear, a press while the session it becomes takes the tasks on is kept', async ($, on) => {
     const { world, clock } = seat(on)
     await start($)
@@ -2016,8 +2069,9 @@ describe('across sessions', () => {
     await clock.settle()
 
     expect(world.status).toBe('☐ 2 tasks for you · /my-tasks')
+    expect(slotsIn(world.store)['session-2']?.tasks.map(task => task.id)).toEqual([1, 7])
     const note = slotsIn(world.store)['session-2']?.took?.['session-1']
-    expect(note?.tasks.map(ref => ref.id)).toEqual([1, 7])
+    expect(note?.tasks.map(ref => ref.id)).toEqual([7])
     expect(note?.isEnded).toBeUndefined()
 
     // Its note stays until it comes back and lets the tasks go.

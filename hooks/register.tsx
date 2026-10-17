@@ -15,6 +15,8 @@ import {
   listOf,
   looksSecret,
   messageOf,
+  newsHeadOf,
+  ownHeadOf,
   parseAsk,
   sameAsk,
   statusOf,
@@ -56,6 +58,7 @@ import {
   legacyOf,
   projectOf,
   prune,
+  withSlot,
 } from './project'
 import type { LegacyEdit, Project, Slot } from './project'
 import { oneLine, printable } from './text'
@@ -81,6 +84,9 @@ const STEERING = [
 
 /** Resolutions pressed this close together go to Claude as one message. */
 const BATCH_MS = 800
+
+/** The longest a person, or Claude, waits on the store: what it doesn't answer by then finishes on its own. */
+const STORE_WAIT_MS = 5000
 
 /** The pane the tasks wait in, and the command that opens it. */
 const PANE = 'my-tasks'
@@ -196,8 +202,6 @@ const live = {
   isUnread: false,
   /** A Send now the running turn could not take: it goes once the turn ends. */
   isSendingAtEnd: false,
-  /** The send under way: the next waits for it, and finds what it marked delivered. */
-  sending: Promise.resolve() as Promise<unknown>,
   /** What the user has typed in an answer field so far, by task. */
   drafts: new Map<number, string>(),
   batch: null as Timer | null,
@@ -219,6 +223,8 @@ const live = {
   endedMs: undefined as number | undefined,
   /** The store work asked for and not yet done: each piece waits for the one before. */
   queue: Promise.resolve() as Promise<unknown>,
+  /** Store work a wait gave up on, not settled yet: while there is any, nothing waits on the store. */
+  stalled: 0,
   /**
    * Turns begun and not yet ended. `turn.start` names no loop, so a loop
    * other than main's (an engine side request, a teammate) may begin one that
@@ -512,21 +518,24 @@ export const register: Register = on => {
       // Claude is idle: this prompt is the answer, sent with every other
       // update Claude has not heard.
       await resolve($, task.id, { state: 'done', ...given }, 'later')
-      const due = (await read($, tasks)).filter(one => one.update === 'pending')
-      const text = messageOf(due)
+      const due = await claim($)
 
-      return passOn($, due, text, 'kept', () => next({ ...e, text }))
+      // The task left meanwhile (another session took it on), or another
+      // send took the answer: the prompt goes as typed.
+      if (due.length === 0) {
+        return next(e)
+      }
+
+      return passOn($, due, ownHeadOf, 'kept', () => next({ ...e, text: messageOf(due) }))
     }
 
-    const due = (await read($, tasks)).filter(one => one.update === 'pending')
+    const due = await claim($)
 
     if (due.length === 0) {
       return next(e)
     }
 
-    const digest = digestOf(due)
-
-    return passOn($, due, digest, 'nothing', () => next({ ...e, context: [...(e.context ?? []), digest] }))
+    return passOn($, due, newsHeadOf, 'nothing', () => next({ ...e, context: [...(e.context ?? []), digestOf(due)] }))
   })
 
   // Read at a conversation's start and again after a compaction: what is
@@ -818,10 +827,13 @@ async function join($: EngineInterface) {
   const root = await $.session.root()
 
   // After /clear the process goes on as a new session, with no slot yet: it
-  // takes over once the old session's writes are done. A store that fails
-  // now takes on nothing; the heartbeat goes on all the same, and the tasks
-  // wait in the store for the next session.
+  // takes over once the old session's writes are done, and takes on what
+  // the old one held, ended whether or not its end write landed. A store
+  // that fails now takes on nothing; the heartbeat goes on all the same, and
+  // the tasks wait in the store for the next session.
   await queued(() => {
+    const left = live.root === root && live.sessionId !== sessionId ? live.sessionId : ''
+
     live.sessionId = sessionId
     live.root = root
     live.hasSlot = false
@@ -829,7 +841,7 @@ async function join($: EngineInterface) {
     live.readMs = 0
     live.endedMs = undefined
 
-    return load($)
+    return load($, left)
   }).catch(() => undefined)
 
   live.heartbeat?.cancel()
@@ -846,16 +858,17 @@ async function join($: EngineInterface) {
  * Takes on the tasks this session owns in the project's store: its own (a
  * resumed session) and those of sessions that ended or went quiet. A live
  * session's tasks stay its own: answers go to the session that asked. A hot
- * reload keeps the session's tasks as they are.
+ * reload keeps the session's tasks as they are. `left`: the session this
+ * process has just left (/clear, a resume in place), whose tasks it holds.
  */
-async function load($: EngineInterface) {
+async function load($: EngineInterface, left = '') {
   if ((await read($, loadedFor)) === live.sessionId) {
     await sync($)
     return
   }
 
   const nowMs = await $.clock.now()
-  const project = await readProject($)
+  const project = await withLeft($, await readProject($), left, nowMs)
   const adoption = adopt(project, live.sessionId, nowMs)
 
   live.readMs = nowMs
@@ -875,17 +888,41 @@ async function load($: EngineInterface) {
 }
 
 /**
+ * The project as read, with the session this process has just left as it
+ * holds it now, and ended: its end write may have failed. Its slot keeps the
+ * time the store has, so that it leaves once this session's is written.
+ */
+async function withLeft($: EngineInterface, project: Project, left: string, nowMs: number): Promise<Project> {
+  if (left === '') {
+    return project
+  }
+
+  const slot = await slotOf($, nowMs)
+  const stored = project.slots[left]
+
+  if (stored === undefined && slot.tasks.length === 0 && slot.took === undefined) {
+    return project
+  }
+
+  return withSlot(project, left, { ...slot, seenMs: stored?.seenMs ?? 0, endedMs: nowMs })
+}
+
+/**
  * Says this session is alive, and counts the tasks waiting in the project's
  * other sessions: `sync`, and a redraw of what it changed. Not `isWriting`
  * where a write follows (assigning).
  */
 async function beat($: EngineInterface, isWriting = true) {
   const was = live.elsewhere
-  const isLost = await queued(() => sync($, isWriting)).catch(() => false)
+  const synced = queued(() => sync($, isWriting))
+    .catch(() => false)
+    .then(async isLost => {
+      if (isLost || live.elsewhere !== was) {
+        await refresh($)
+      }
+    })
 
-  if (isLost || live.elsewhere !== was) {
-    await refresh($)
-  }
+  await awaited($, synced)
 }
 
 /**
@@ -968,6 +1005,38 @@ function queued<T>(work: () => Promise<T>): Promise<T> {
 }
 
 /**
+ * Resolves once `work` settles, or `STORE_WAIT_MS` on: a press, a prompt or
+ * a tool call goes on without a store that is slow to answer, and the work
+ * finishes on its own, in its place in the queue. Until work given up on
+ * settles, nothing waits on the store at all.
+ */
+function awaited($: EngineInterface, work: Promise<unknown>): Promise<void> {
+  if (live.stalled > 0) {
+    return Promise.resolve()
+  }
+
+  return new Promise(resolve => {
+    let isStalled = false
+    const timer = $.clock.after(STORE_WAIT_MS, () => {
+      isStalled = true
+      live.stalled += 1
+      resolve()
+    })
+    const done = () => {
+      timer.cancel()
+
+      if (isStalled) {
+        live.stalled -= 1
+      }
+
+      resolve()
+    }
+
+    void work.then(done, done)
+  })
+}
+
+/**
  * Reads the project: 0.1.4's value, when there is one, and each session's
  * slot, one read of the store each. Joining, the heartbeat and assigning
  * read it; a pane press or a prompt, which a person waits on, doesn't.
@@ -988,26 +1057,29 @@ async function readProject($: EngineInterface): Promise<Project> {
  * and the next session in the project removes it.
  */
 async function writeOwn($: EngineInterface, isForced = false) {
-  const shown = (await read($, tasks)).filter(isShown)
-  const notes = await read($, took)
-  const hasNotes = Object.keys(notes).length > 0
-
-  if (!live.hasSlot && !isForced && shown.length === 0 && !hasNotes) {
-    return
-  }
-
   const nowMs = await $.clock.now()
-  const slot: Slot = {
-    tasks: [...shown],
-    seenMs: nowMs,
-    nextId: await read($, nextId),
-    ...(hasNotes ? { took: { ...notes } } : {}),
-    ...(live.endedMs === undefined ? {} : { endedMs: live.endedMs }),
+  const slot = await slotOf($, nowMs)
+
+  if (!live.hasSlot && !isForced && slot.tasks.length === 0 && slot.took === undefined) {
+    return
   }
 
   await $.store.set(keysOf(live.root).session(live.sessionId), slot)
   live.hasSlot = true
   live.writtenMs = nowMs
+}
+
+/** The session's slot, from what it holds now. */
+async function slotOf($: EngineInterface, nowMs: number): Promise<Slot> {
+  const notes = await read($, took)
+
+  return {
+    tasks: (await read($, tasks)).filter(isShown),
+    seenMs: nowMs,
+    nextId: await read($, nextId),
+    ...(Object.keys(notes).length > 0 ? { took: { ...notes } } : {}),
+    ...(live.endedMs === undefined ? {} : { endedMs: live.endedMs }),
+  }
 }
 
 /**
@@ -1071,8 +1143,29 @@ async function wake($: EngineInterface) {
 async function change($: EngineInterface, fn: (list: readonly Task[]) => readonly Task[]) {
   await wake($)
   await update($, tasks, fn)
-  await queued(() => writeOwn($)).catch(() => undefined)
+  await awaited($, queued(() => writeOwn($)))
   await refresh($)
+}
+
+/**
+ * Marks every update Claude has not heard delivered, in one change of the
+ * task list, and resolves them: the path that claims them sends them, and
+ * no other finds them waiting meanwhile.
+ */
+async function claim($: EngineInterface): Promise<readonly Task[]> {
+  let due: readonly Task[] = []
+
+  if (!(await read($, tasks)).some(task => task.update === 'pending')) {
+    return due
+  }
+
+  await change($, list => {
+    due = list.filter(task => task.update === 'pending')
+
+    return list.map(task => (task.update === 'pending' ? { ...task, update: 'delivered' } : task))
+  })
+
+  return due
 }
 
 /**
@@ -1149,54 +1242,55 @@ async function delivered($: EngineInterface, ids: readonly number[]) {
 }
 
 /**
- * Passes on a prompt that carries `due` to Claude, as `carried`: marked
- * delivered first, so no other path sends them meanwhile. When it doesn't
- * enter with them (a hook beneath dropped it or took them out, or it
- * failed), they wait again for the next send, and a toast says so, as
- * `onDrop` says for a drop.
+ * Passes on a prompt that carries `due` to Claude, each update opening as
+ * `headOf` writes it; the caller claimed them, so no other path sends them
+ * meanwhile. Those that don't enter with it (a hook beneath dropped it or
+ * took them out, or it failed) wait again for the next send, and a toast
+ * says so, as `onDrop` says for a drop.
  */
 async function passOn<R extends PromptSubmitResult>(
   $: EngineInterface,
   due: readonly Task[],
-  carried: string,
+  headOf: (task: Task) => string,
   onDrop: DropNote,
   pass: () => Promise<R>,
 ): Promise<R> {
-  const ids = due.map(one => one.id)
-  let back: { note: DropNote; reason?: string } | undefined
-
-  await delivered($, ids)
+  let back: { lost: readonly Task[]; note: DropNote; reason?: string } | undefined
 
   try {
     const result = await pass()
 
     if (result.drop !== undefined) {
-      back = { note: onDrop, reason: result.drop }
-    } else if (!isCarried(result, carried)) {
-      back = { note: 'why', reason: 'a hook took it out of the prompt' }
+      back = { lost: due, note: onDrop, reason: result.drop }
+    } else {
+      const lost = due.filter(task => !isCarried(result, headOf(task)))
+
+      if (lost.length > 0) {
+        back = { lost, note: 'why', reason: 'a hook took it out of the prompt' }
+      }
     }
 
     return result
   } catch (error) {
-    back = { note: 'why', reason: error instanceof Error ? error.message : String(error) }
+    back = { lost: due, note: 'why', reason: error instanceof Error ? error.message : String(error) }
 
     throw error
   } finally {
     if (back !== undefined) {
-      await giveBack($, ids, back.note, back.reason)
+      await giveBack($, back.lost.map(task => task.id), back.note, back.reason)
     }
   }
 }
 
 /**
- * Whether a prompt that entered carries `text`, in its words or beside them,
- * by its opening line: a hook beneath may rewrite what the updates say (mask
- * a secret in an answer, say); one that takes them out leaves them to send.
+ * Whether a prompt that entered carries an update, in its words or beside
+ * them, by how the update opens (`head`): a hook beneath may rewrite what an
+ * answer says (mask a secret in it, say); one that takes the update out, or
+ * rewords its head, leaves it to send again, since Claude hearing it twice
+ * beats not hearing it.
  */
-function isCarried(result: PromptSubmitResult, text: string): boolean {
-  const opening = text.split('\n', 1)[0] ?? text
-
-  return result.drop === undefined && (result.text.includes(opening) || (result.context ?? []).some(block => block.includes(opening)))
+function isCarried(entered: { text: string; context?: readonly string[] }, head: string): boolean {
+  return entered.text.includes(head) || (entered.context ?? []).some(block => block.includes(head))
 }
 
 /**
@@ -1325,19 +1419,11 @@ function sendSoon($: EngineInterface) {
  * Hands Claude every update it has not heard: a turn of its own while it is
  * idle, a row its running turn reads at the next step while it works.
  * `isTurnOver`: sent as main's turn ends, when Claude is idle whatever the
- * engine's last word on it was. One send at a time, so two never carry one
- * update.
+ * engine's last word on it was.
  */
-function send($: EngineInterface, isTurnOver = false): Promise<void> {
-  const done = live.sending.then(() => sendDue($, isTurnOver))
-  live.sending = done.catch(() => undefined)
-
-  return done
-}
-
-async function sendDue($: EngineInterface, isTurnOver: boolean) {
+async function send($: EngineInterface, isTurnOver = false) {
   await wake($)
-  const due = (await read($, tasks)).filter(task => task.update === 'pending')
+  const due = await claim($)
 
   if (due.length === 0) {
     return
@@ -1348,7 +1434,7 @@ async function sendDue($: EngineInterface, isTurnOver: boolean) {
   const which = ids.map(id => `#${id}`).join(', ')
 
   if (isTurnOver || !working()) {
-    await passOn($, due, text, 'why', () => $.prompt.submit({ text, asUser: true })).catch(() => undefined)
+    await passOn($, due, ownHeadOf, 'why', () => $.prompt.submit({ text, asUser: true })).catch(() => undefined)
     return
   }
 
@@ -1358,13 +1444,20 @@ async function sendDue($: EngineInterface, isTurnOver: boolean) {
   )
 
   if (!isTaken) {
+    await undelivered($, ids)
+
+    // The turn ended while the row was being refused: they go now.
+    if (!working()) {
+      void send($, true)
+      return
+    }
+
     live.isSendingAtEnd = true
     $.ui.toast(`Claude gets your response to ${which} when it finishes this turn.`)
     return
   }
 
   live.isUnread = true
-  await delivered($, ids)
 
   try {
     await $.session.append({ message: { type: 'system', content: [{ type: 'text', text: `Sent your response to ${which} to Claude` }] } })

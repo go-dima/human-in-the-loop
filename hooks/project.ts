@@ -34,8 +34,18 @@ export type Note = { ids: number[]; atMs: number }
  */
 export type Legacy = { nextId: number; sessions: Record<string, Slot>; taken: Record<string, Note> }
 
-/** A project as the store holds it: each session's slot by session id, and 0.1.4's value. */
-export type Project = { slots: Record<string, Slot>; legacy: Legacy }
+/**
+ * A project as the store holds it: each session's slot by session id, and
+ * 0.1.4's value. Gathered from them as read: every slot of both (a session in
+ * both writes its own key now), and the tasks other sessions noted taking on
+ * from each, by its id.
+ */
+export type Project = {
+  slots: Record<string, Slot>
+  legacy: Legacy
+  all: Record<string, Slot>
+  tookFrom: Record<string, TaskRef[]>
+}
 
 /** A change to 0.1.4's value: slots taken out, notes left for their quiet sessions, and this session's note read. */
 export type LegacyEdit = { removed: string[]; taken: Record<string, Note>; read?: string }
@@ -89,14 +99,27 @@ export function isSlot(value: unknown): value is Slot {
   return slot !== null && typeof slot === 'object' && Array.isArray(slot.tasks) && typeof slot.seenMs === 'number'
 }
 
+function isNote(value: unknown): value is Note {
+  const note = value as Partial<Note> | null
+
+  return note !== null && typeof note === 'object' && Array.isArray(note.ids) && typeof note.atMs === 'number'
+}
+
+/** The entries of a stored record that are what `is` asks for; anything else in it is skipped. */
+function entriesOf<T>(raw: unknown, is: (value: unknown) => value is T): Record<string, T> {
+  const entries = raw !== null && typeof raw === 'object' ? Object.entries(raw) : []
+
+  return Object.fromEntries(entries.filter((entry): entry is [string, T] => is(entry[1])))
+}
+
 /** Reads 0.1.4's value, its first layout (one list for the project) included. */
 export function legacyOf(raw: unknown): Legacy {
   const value = (raw ?? {}) as { nextId?: unknown; sessions?: unknown; tasks?: unknown; taken?: unknown }
   const nextId = typeof value.nextId === 'number' ? value.nextId : 1
-  const taken = value.taken !== null && typeof value.taken === 'object' ? (value.taken as Record<string, Note>) : {}
+  const taken = entriesOf(value.taken, isNote)
 
   if (value.sessions !== null && typeof value.sessions === 'object') {
-    return { nextId, sessions: value.sessions as Record<string, Slot>, taken }
+    return { nextId, sessions: entriesOf(value.sessions, isSlot), taken }
   }
 
   // The first layout kept one list per project: its tasks belong to sessions
@@ -122,22 +145,31 @@ export function projectOf(root: string, values: Readonly<Record<string, unknown>
     }
   }
 
-  return { slots, legacy: legacyOf(keys.legacy === undefined ? undefined : values[keys.legacy]) }
+  return gathered(slots, legacyOf(keys.legacy === undefined ? undefined : values[keys.legacy]))
 }
 
-/** Every slot of a project, once gathered: a project as read doesn't change. */
-const gathered = new WeakMap<Project, Record<string, Slot>>()
+/**
+ * `project` with session `id`'s slot as given: the process's own account of
+ * a session it has just left, which the store may not have yet.
+ */
+export function withSlot(project: Project, id: string, slot: Slot): Project {
+  return gathered({ ...project.slots, [id]: slot }, project.legacy)
+}
 
-/** Every slot, 0.1.4's and this version's; a session in both writes its own key now. */
-function slotsOf(project: Project): Record<string, Slot> {
-  let all = gathered.get(project)
+/** A project from its slots and 0.1.4's value, with what is gathered from them. */
+function gathered(slots: Record<string, Slot>, legacy: Legacy): Project {
+  const all = { ...legacy.sessions, ...slots }
+  const tookFrom: Record<string, TaskRef[]> = {}
 
-  if (all === undefined) {
-    all = { ...project.legacy.sessions, ...project.slots }
-    gathered.set(project, all)
+  for (const [other, slot] of Object.entries(all)) {
+    for (const [id, note] of Object.entries(slot.took ?? {})) {
+      if (id !== other) {
+        tookFrom[id] = [...(tookFrom[id] ?? []), ...note.tasks]
+      }
+    }
   }
 
-  return all
+  return { slots, legacy, all, tookFrom }
 }
 
 const refOf = (task: Task): TaskRef => ({ id: task.id, createdMs: task.createdMs })
@@ -151,11 +183,7 @@ const isRefTo = (task: Task) => (ref: TaskRef) => isSameRef(ref, task)
  * taker's slot, or in a 0.1.4 note, which names numbers only.
  */
 export function isTakenFrom(project: Project, id: string, task: Task): boolean {
-  if (project.legacy.taken[id]?.ids.includes(task.id) === true) {
-    return true
-  }
-
-  return Object.entries(slotsOf(project)).some(([other, slot]) => other !== id && slot.took?.[id]?.tasks.some(isRefTo(task)) === true)
+  return project.legacy.taken[id]?.ids.includes(task.id) === true || project.tookFrom[id]?.some(isRefTo(task)) === true
 }
 
 /** The tasks in session `id`'s slot that no other session took on. */
@@ -174,7 +202,7 @@ export function isGone(slot: Slot, nowMs: number): boolean {
  * only once a later one carries it, so this never goes back.
  */
 export function floorOf(project: Project): number {
-  const slots = Object.values(slotsOf(project))
+  const slots = Object.values(project.all)
 
   return Math.max(project.legacy.nextId, ...slots.map(slot => slot.nextId ?? 1), ...slots.flatMap(slot => slot.tasks.map(task => task.id + 1)))
 }
@@ -186,7 +214,7 @@ export function hasLegacyPeer(project: Project, sessionId: string, nowMs: number
 
 /** How many tasks wait in the project's other live sessions. */
 export function elsewhereIn(project: Project, sessionId: string, nowMs: number): number {
-  return Object.entries(slotsOf(project))
+  return Object.entries(project.all)
     .filter(([id, slot]) => id !== sessionId && !isGone(slot, nowMs))
     .reduce((sum, [id, slot]) => sum + heldIn(project, id, slot).length, 0)
 }
@@ -239,7 +267,7 @@ export type Adoption = {
  * keep theirs, the numbers its Claude knows, and a later one gets a new one.
  */
 export function adopt(project: Project, sessionId: string, nowMs: number): Adoption {
-  const all = slotsOf(project)
+  const all = project.all
   const ids = Object.keys(all).sort((a, b) => Number(b === sessionId) - Number(a === sessionId))
   const adopted: Task[] = []
   const took: Record<string, Took> = {}
@@ -310,8 +338,8 @@ export function adopt(project: Project, sessionId: string, nowMs: number): Adopt
  * the session it took from let go of the tasks, or it ended and its slot is
  * gone, or the note is a month old. A slot left behind (an ended session's,
  * whose removal didn't happen, or a quiet one's that never came back in a
- * month) is removed now, its note kept until it is gone; so are the
- * session's own leftovers in 0.1.4's value.
+ * month) is removed now, its note kept until it is gone and its own notes
+ * carried over; so are the session's own leftovers in 0.1.4's value.
  */
 export function prune(
   project: Project,
@@ -319,19 +347,21 @@ export function prune(
   took: Readonly<Record<string, Took>>,
   nowMs: number,
 ): { took: Record<string, Took>; removed: string[]; legacy: LegacyEdit } {
-  const all = slotsOf(project)
   const kept: Record<string, Took> = {}
   const removed: string[] = []
   const legacy = ownLegacy(project, sessionId)
+  const keep = (id: string, note: Took) => {
+    kept[id] = merged(kept[id], note)
+  }
 
   for (const [id, note] of Object.entries(took)) {
-    const slot = all[id]
+    const slot = project.all[id]
     const isExpired = nowMs - note.atMs > TAKEN_MS
 
     if (slot === undefined) {
       // A quiet session may come back with its tasks in memory: the note waits for it.
       if (note.isEnded !== true && !isExpired) {
-        kept[id] = note
+        keep(id, note)
       }
 
       continue
@@ -346,6 +376,13 @@ export function prune(
     if (slot.seenMs <= note.atMs && (note.isEnded === true || isExpired || !(id in project.slots))) {
       if (id in project.slots) {
         removed.push(id)
+
+        // What it took on from others, it may hold yet: its notes go on here.
+        for (const [from, other] of Object.entries(slot.took ?? {})) {
+          if (from !== sessionId) {
+            keep(from, other)
+          }
+        }
       } else {
         legacy.removed.push(id)
 
@@ -354,12 +391,12 @@ export function prune(
         }
       }
 
-      kept[id] = note
+      keep(id, note)
       continue
     }
 
     if (!isExpired) {
-      kept[id] = note
+      keep(id, note)
     }
   }
 

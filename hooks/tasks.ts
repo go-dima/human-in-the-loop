@@ -104,16 +104,26 @@ function bodyOf(task: Task, isFull: boolean): string {
   }
 }
 
+/** How a task's news opens: `#5 done: <title>.` */
+export function newsHeadOf(task: Task): string {
+  return `#${task.id} ${task.state}: ${task.title}.`
+}
+
 /** One task's news for Claude: `#5 done: <title>.` and what the user said. */
 export function newsOf(task: Task, isFull: boolean): string {
   const body = bodyOf(task, isFull)
 
-  return `#${task.id} ${task.state}: ${task.title}.${body === '' ? '' : ` ${body}`}`
+  return `${newsHeadOf(task)}${body === '' ? '' : ` ${body}`}`
+}
+
+/** How what the user did with a task opens, in their own words: `#5 <title>:` */
+export function ownHeadOf(task: Task): string {
+  return `#${task.id} ${task.title}:`
 }
 
 /** What the user did with a task, in their own words. */
 function ownWordsOf(task: Task): string {
-  const head = `#${task.id} ${task.title}:`
+  const head = ownHeadOf(task)
 
   switch (task.state) {
     case 'rejected':

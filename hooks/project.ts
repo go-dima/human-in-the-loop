@@ -37,8 +37,8 @@ export type Legacy = { nextId: number; sessions: Record<string, Slot>; taken: Re
 /**
  * A project as the store holds it: each session's slot by session id, and
  * 0.1.4's value. Gathered from them as read: every slot of both (a session in
- * both writes its own key now), and the tasks other sessions noted taking on
- * from each, by its id.
+ * both writes its own key now), its notes less what was taken back since, and
+ * the tasks other sessions noted taking on from each, by its id.
  */
 export type Project = {
   slots: Record<string, Slot>
@@ -222,11 +222,15 @@ export function withSlot(project: Project, id: string, slot: Slot): Project {
 
 /** A project from its slots and 0.1.4's value, with what is gathered from them. */
 function gathered(slots: Record<string, Slot>, legacy: Legacy): Project {
-  const all = { ...legacy.sessions, ...slots }
+  const stored = { ...legacy.sessions, ...slots }
+  const all: Record<string, Slot> = {}
   const tookFrom: Record<string, TaskRef[]> = {}
 
-  for (const [other, slot] of Object.entries(all)) {
-    for (const [id, note] of Object.entries(slot.took ?? {})) {
+  for (const [other, slot] of Object.entries(stored)) {
+    const took = slot.took === undefined ? undefined : Object.fromEntries(Object.entries(slot.took).map(([id, note]) => [id, stillTaken(stored, other, id, note)]))
+    all[other] = took === undefined ? slot : { ...slot, took }
+
+    for (const [id, note] of Object.entries(took ?? {})) {
       if (id !== other) {
         tookFrom[id] = [...(tookFrom[id] ?? []), ...note.tasks]
       }
@@ -234,6 +238,22 @@ function gathered(slots: Record<string, Slot>, legacy: Legacy): Project {
   }
 
   return { slots, legacy, all, tookFrom }
+}
+
+/**
+ * `note`, of the tasks session `taker` took on from session `from`, less
+ * those `from` took back since: a session resumed after it ended, say, that
+ * takes its tasks back from a quiet one that had taken them. Its later note
+ * outweighs the older one, which the quiet one drops if it comes back.
+ */
+function stillTaken(all: Readonly<Record<string, Slot>>, taker: string, from: string, note: Took): Took {
+  const back = all[from]?.took?.[taker]
+
+  if (back === undefined || back.atMs <= note.atMs) {
+    return note
+  }
+
+  return { ...note, tasks: note.tasks.filter(ref => !back.tasks.some(mine => isSameRef(mine, ref))) }
 }
 
 const refOf = (task: Task): TaskRef => ({ id: task.id, createdMs: task.createdMs })
@@ -416,12 +436,12 @@ export function adopt(project: Project, sessionId: string, nowMs: number): Adopt
 
 /**
  * Session `sessionId`'s notes of what it took, less those no longer needed:
- * the session it took from let go of the tasks, or it ended and its slot is
- * gone, or the note is a month old. A slot left behind (an ended session's,
- * whose removal didn't happen, or a quiet one's that never came back in a
- * month) is removed now, with any copy of it in 0.1.4's value, its note
- * kept until it is gone and its own notes carried over; so are the
- * session's own leftovers in 0.1.4's value.
+ * the session it took from let go of the tasks or took them back, or it
+ * ended and its slot is gone, or the note is a month old. A slot left
+ * behind (an ended session's, whose removal didn't happen, or a quiet one's
+ * that never came back in a month) is removed now, with any copy of it in
+ * 0.1.4's value, its note kept until it is gone and its own notes carried
+ * over; so are the session's own leftovers in 0.1.4's value.
  */
 export function prune(
   project: Project,
@@ -436,9 +456,14 @@ export function prune(
     kept[id] = merged(kept[id], note)
   }
 
-  for (const [id, note] of Object.entries(took)) {
+  for (const [id, mine] of Object.entries(took)) {
+    const note = stillTaken(project.all, sessionId, id, mine)
     const slot = project.all[id]
     const isExpired = nowMs - note.atMs > TAKEN_MS
+
+    if (note.tasks.length === 0) {
+      continue
+    }
 
     if (slot === undefined) {
       // A quiet session may come back with its tasks in memory: the note waits for it.

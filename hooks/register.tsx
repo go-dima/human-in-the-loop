@@ -844,7 +844,9 @@ async function join($: EngineInterface) {
   // until it has read the project, which the heartbeat tries again.
   await queued(async () => {
     if (live.root !== '' && live.root !== root) {
+      await update($, tasks, () => [])
       await update($, loadedFor, () => null)
+      live.elsewhere = 0
     }
 
     live.sessionId = sessionId
@@ -888,7 +890,8 @@ async function load($: EngineInterface) {
   let adoption!: Adoption
 
   // Taken on against the task list as it stands when it changes hands, so a
-  // press meanwhile is kept.
+  // press meanwhile is kept. `update` runs this again when another write
+  // beat it: the last run is the list it wrote.
   await update($, tasks, current => {
     project = withHeld(stored, holder, slotFrom(current, notes, count, nowMs), nowMs)
     adoption = adopt(project, live.sessionId, nowMs)
@@ -924,9 +927,10 @@ async function isLoaded($: EngineInterface): Promise<boolean> {
  * may not have. Held for another session (`holder`, the one it left at
  * /clear or a resume in place), it is that session's slot, ended: its end
  * write may have failed. The slot keeps the time the store has, so that it
- * leaves once this session's is written. Held for none, it is the tasks the
- * session assigned before it could read the project, beside those the store
- * holds for it.
+ * leaves once this session's is written. Held for none (no session of the
+ * process has read the project), it is the tasks its sessions assigned, each
+ * beside those the store holds for the session that assigned it, which has
+ * ended unless it is this one.
  */
 function withHeld(project: Project, holder: string | null, slot: Slot, nowMs: number): Project {
   if (holder !== null) {
@@ -939,10 +943,21 @@ function withHeld(project: Project, holder: string | null, slot: Slot, nowMs: nu
     return withSlot(project, holder, { ...slot, seenMs: stored?.seenMs ?? 0, endedMs: nowMs })
   }
 
-  const own = slot.tasks.filter(task => task.sessionId === live.sessionId)
-  const stored = project.all[live.sessionId]
+  let held = project
 
-  return own.length === 0 ? project : withSlot(project, live.sessionId, { seenMs: 0, ...stored, tasks: [...own, ...(stored?.tasks ?? [])] })
+  for (const id of new Set(slot.tasks.map(task => task.sessionId))) {
+    const own = slot.tasks.filter(task => task.sessionId === id)
+    const stored = held.all[id]
+
+    held = withSlot(held, id, {
+      seenMs: 0,
+      ...stored,
+      tasks: [...own, ...(stored?.tasks ?? [])],
+      ...(id === live.sessionId ? {} : { endedMs: nowMs }),
+    })
+  }
+
+  return held
 }
 
 /**

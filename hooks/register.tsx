@@ -52,13 +52,14 @@ import {
   floorOf,
   hasLegacyPeer,
   isEmptyEdit,
+  isGone,
   isSlot,
   isTakenFrom,
   keysOf,
   legacyOf,
   projectOf,
   prune,
-  withSlot,
+  withSlots,
 } from './project'
 import type { Adoption, LegacyEdit, Project, Slot } from './project'
 import { oneLine, printable } from './text'
@@ -839,14 +840,19 @@ async function join($: EngineInterface) {
   // takes over once the old session's writes are done, and takes on what
   // the old one held, ended whether or not its end write landed (or, when
   // the old one never read the project, what the one before it held). What
-  // it holds for another folder's project waits in that folder's store. A
-  // store that fails now takes nothing on yet: the session writes nothing
-  // until it has read the project, which the heartbeat tries again.
+  // it holds for another folder's project waits in that folder's store, and
+  // it starts on this one as a new process would. A store that fails now
+  // takes nothing on yet: the session writes nothing until it has read the
+  // project, which the heartbeat tries again.
   await queued(async () => {
     if (live.root !== '' && live.root !== root) {
       await update($, tasks, () => [])
+      await update($, nextId, () => 1)
+      await update($, editing, () => null)
       await update($, loadedFor, () => null)
+      live.drafts.clear()
       live.elsewhere = 0
+      live.floor = 0
     }
 
     live.sessionId = sessionId
@@ -930,7 +936,8 @@ async function isLoaded($: EngineInterface): Promise<boolean> {
  * leaves once this session's is written. Held for none (no session of the
  * process has read the project), it is the tasks its sessions assigned, each
  * beside those the store holds for the session that assigned it, which has
- * ended unless it is this one.
+ * ended unless it is this one, or another process has resumed it since: then
+ * this one holds them.
  */
 function withHeld(project: Project, holder: string | null, slot: Slot, nowMs: number): Project {
   if (holder !== null) {
@@ -940,24 +947,27 @@ function withHeld(project: Project, holder: string | null, slot: Slot, nowMs: nu
       return project
     }
 
-    return withSlot(project, holder, { ...slot, seenMs: stored?.seenMs ?? 0, endedMs: nowMs })
+    return withSlots(project, { [holder]: { ...slot, seenMs: stored?.seenMs ?? 0, endedMs: nowMs } })
   }
 
-  let held = project
+  const own = live.sessionId
+  const slots: Record<string, Slot> = {}
 
-  for (const id of new Set(slot.tasks.map(task => task.sessionId))) {
-    const own = slot.tasks.filter(task => task.sessionId === id)
-    const stored = held.all[id]
+  for (const task of slot.tasks) {
+    const stored = project.all[task.sessionId]
+    // A session of the process that another has resumed since keeps its
+    // slot, which this process never wrote: what it held goes on in this one's.
+    const id = stored === undefined || isGone(stored, nowMs) ? task.sessionId : own
+    const into = (slots[id] ??= { seenMs: 0, ...project.all[id], tasks: [], ...(id === own ? {} : { endedMs: nowMs }) })
 
-    held = withSlot(held, id, {
-      seenMs: 0,
-      ...stored,
-      tasks: [...own, ...(stored?.tasks ?? [])],
-      ...(id === live.sessionId ? {} : { endedMs: nowMs }),
-    })
+    into.tasks.push(task)
   }
 
-  return held
+  for (const [id, held] of Object.entries(slots)) {
+    held.tasks.push(...(project.all[id]?.tasks ?? []))
+  }
+
+  return withSlots(project, slots)
 }
 
 /**
@@ -998,14 +1008,17 @@ async function sync($: EngineInterface, isWriting = true): Promise<boolean> {
   }
 
   const nowMs = await $.clock.now()
-  const project = await readProject($)
+  const stored = await readProject($)
   const own = live.sessionId
+  // With the session's own slot as it holds it: the store may not have its
+  // last write, the note of tasks it took back among them.
+  const project = withSlots(stored, { [own]: await slotOf($, nowMs) })
   const isLost = await letGo($, project)
   const pruned = prune(project, own, await read($, took), nowMs)
 
   await update($, took, () => pruned.took)
   live.readMs = nowMs
-  live.hasSlot ||= own in project.slots
+  live.hasSlot ||= own in stored.slots
   live.elsewhere = elsewhereIn(project, own, nowMs)
   live.floor = floorOf(project)
   live.hasLegacyPeer = hasLegacyPeer(project, own, nowMs)

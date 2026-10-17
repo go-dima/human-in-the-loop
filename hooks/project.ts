@@ -213,11 +213,11 @@ export function projectOf(root: string, values: Readonly<Record<string, unknown>
 }
 
 /**
- * `project` with session `id`'s slot as given: the process's own account of
- * a session it has just left, which the store may not have yet.
+ * `project` with these sessions' slots as given: the process's own account
+ * of them, which the store may not have yet.
  */
-export function withSlot(project: Project, id: string, slot: Slot): Project {
-  return gathered({ ...project.slots, [id]: slot }, project.legacy)
+export function withSlots(project: Project, slots: Readonly<Record<string, Slot>>): Project {
+  return gathered({ ...project.slots, ...slots }, project.legacy)
 }
 
 /** A project from its slots and 0.1.4's value, with what is gathered from them. */
@@ -227,7 +227,8 @@ function gathered(slots: Record<string, Slot>, legacy: Legacy): Project {
   const tookFrom: Record<string, TaskRef[]> = {}
 
   for (const [other, slot] of Object.entries(stored)) {
-    const took = slot.took === undefined ? undefined : Object.fromEntries(Object.entries(slot.took).map(([id, note]) => [id, stillTaken(stored, other, id, note)]))
+    const notes = Object.entries(slot.took ?? {}).map(([id, note]) => [id, stillTaken(stored, other, id, note)] as const)
+    const took = slot.took === undefined ? undefined : Object.fromEntries(notes.filter(([, note]) => note.tasks.length > 0))
     all[other] = took === undefined ? slot : { ...slot, took }
 
     for (const [id, note] of Object.entries(took ?? {})) {
@@ -253,12 +254,15 @@ function stillTaken(all: Readonly<Record<string, Slot>>, taker: string, from: st
     return note
   }
 
-  return { ...note, tasks: note.tasks.filter(ref => !back.tasks.some(mine => isSameRef(mine, ref))) }
+  return { ...note, tasks: without(note.tasks, back.tasks) }
 }
 
 const refOf = (task: Task): TaskRef => ({ id: task.id, createdMs: task.createdMs })
 
 const isSameRef = (one: TaskRef, other: TaskRef) => one.id === other.id && one.createdMs === other.createdMs
+
+/** The refs of `refs` that `others` doesn't name. */
+const without = (refs: readonly TaskRef[], others: readonly TaskRef[]) => refs.filter(ref => !others.some(other => isSameRef(other, ref)))
 
 const isRefTo = (task: Task) => (ref: TaskRef) => isSameRef(ref, task)
 
@@ -309,7 +313,7 @@ function merged(one: Took | undefined, other: Took): Took {
     return other
   }
 
-  const tasks = [...one.tasks, ...other.tasks.filter(ref => !one.tasks.some(mine => isSameRef(mine, ref)))]
+  const tasks = [...one.tasks, ...without(other.tasks, one.tasks)]
   const isEnded = one.isEnded === true && other.isEnded === true
 
   return { tasks, atMs: Math.max(one.atMs, other.atMs), ...(isEnded ? { isEnded } : {}) }

@@ -60,7 +60,7 @@ import {
   prune,
   withSlot,
 } from './project'
-import type { LegacyEdit, Project, Slot } from './project'
+import type { Adoption, LegacyEdit, Project, Slot } from './project'
 import { oneLine, printable } from './text'
 
 const PLUGIN = 'human-in-the-loop'
@@ -201,11 +201,6 @@ type Entered = { text: string; context?: readonly string[] }
 const live = {
   sessionId: '',
   root: '',
-  /**
-   * After /clear or a resume in place, the session the process left, whose
-   * tasks it holds until the session it became has read the project.
-   */
-  left: '',
   /** A Send now row joined the running turn and no step has read it yet. */
   isUnread: false,
   /** A Send now the running turn could not take: it goes once the turn ends. */
@@ -843,14 +838,13 @@ async function join($: EngineInterface) {
   // After /clear the process goes on as a new session, with no slot yet: it
   // takes over once the old session's writes are done, and takes on what
   // the old one held, ended whether or not its end write landed (or, when
-  // the old one never read the project, what the one before it held). A
+  // the old one never read the project, what the one before it held). What
+  // it holds for another folder's project waits in that folder's store. A
   // store that fails now takes nothing on yet: the session writes nothing
   // until it has read the project, which the heartbeat tries again.
-  await queued(() => {
-    if (live.root !== root) {
-      live.left = ''
-    } else if (live.left === '' && live.sessionId !== sessionId) {
-      live.left = live.sessionId
+  await queued(async () => {
+    if (live.root !== '' && live.root !== root) {
+      await update($, loadedFor, () => null)
     }
 
     live.sessionId = sessionId
@@ -886,13 +880,23 @@ async function load($: EngineInterface) {
   }
 
   const nowMs = await $.clock.now()
-  const project = await withHeld($, await readProject($), nowMs)
-  const adoption = adopt(project, live.sessionId, nowMs)
+  const stored = await readProject($)
+  const holder = await read($, loadedFor)
+  const notes = await read($, took)
+  const count = await read($, nextId)
+  let project = stored
+  let adoption!: Adoption
 
-  live.left = ''
+  // Taken on against the task list as it stands when it changes hands, so a
+  // press meanwhile is kept.
+  await update($, tasks, current => {
+    project = withHeld(stored, holder, slotFrom(current, notes, count, nowMs), nowMs)
+    adoption = adopt(project, live.sessionId, nowMs)
+
+    return adoption.adopted
+  })
+
   live.readMs = nowMs
-
-  await update($, tasks, () => adoption.adopted)
   await update($, nextId, n => Math.max(n, adoption.nextId))
   await update($, took, () => adoption.took)
   await update($, loadedFor, () => live.sessionId)
@@ -906,30 +910,33 @@ async function load($: EngineInterface) {
   await clean($, project, adoption.removed, adoption.legacy)
 }
 
-/** Whether the session has read the project as itself: until then, the store may hold tasks of its own it hasn't taken on. */
+/**
+ * Whether the session has read the project as itself: until then, the store
+ * may hold tasks of its own it hasn't taken on. `loadedFor` names the session
+ * whose tasks the process holds.
+ */
 async function isLoaded($: EngineInterface): Promise<boolean> {
   return (await read($, loadedFor)) === live.sessionId
 }
 
 /**
- * The project as read, with what this process holds that the store may not
- * have. After /clear or a resume in place, that is the session it left, as
- * it holds it now, and ended: its end write may have failed. Its slot keeps
- * the time the store has, so that it leaves once this session's is written.
- * Otherwise, the tasks the session assigned before it could read the
- * project, beside those the store holds for it.
+ * The project as read, with what this process holds (`slot`) that the store
+ * may not have. Held for another session (`holder`, the one it left at
+ * /clear or a resume in place), it is that session's slot, ended: its end
+ * write may have failed. The slot keeps the time the store has, so that it
+ * leaves once this session's is written. Held for none, it is the tasks the
+ * session assigned before it could read the project, beside those the store
+ * holds for it.
  */
-async function withHeld($: EngineInterface, project: Project, nowMs: number): Promise<Project> {
-  const slot = await slotOf($, nowMs)
-
-  if (live.left !== '') {
-    const stored = project.slots[live.left]
+function withHeld(project: Project, holder: string | null, slot: Slot, nowMs: number): Project {
+  if (holder !== null) {
+    const stored = project.slots[holder]
 
     if (stored === undefined && slot.tasks.length === 0 && slot.took === undefined) {
       return project
     }
 
-    return withSlot(project, live.left, { ...slot, seenMs: stored?.seenMs ?? 0, endedMs: nowMs })
+    return withSlot(project, holder, { ...slot, seenMs: stored?.seenMs ?? 0, endedMs: nowMs })
   }
 
   const own = slot.tasks.filter(task => task.sessionId === live.sessionId)
@@ -1120,12 +1127,15 @@ async function writeOwn($: EngineInterface, isForced = false) {
 
 /** The session's slot, from what it holds now. */
 async function slotOf($: EngineInterface, nowMs: number): Promise<Slot> {
-  const notes = await read($, took)
+  return slotFrom(await read($, tasks), await read($, took), await read($, nextId), nowMs)
+}
 
+/** The session's slot, holding `list`, its `notes` of what it took, and its count. */
+function slotFrom(list: readonly Task[], notes: Readonly<Record<string, Took>>, count: number, nowMs: number): Slot {
   return {
-    tasks: (await read($, tasks)).filter(isShown),
+    tasks: list.filter(isShown),
     seenMs: nowMs,
-    nextId: await read($, nextId),
+    nextId: count,
     ...(Object.keys(notes).length > 0 ? { took: { ...notes } } : {}),
     ...(live.endedMs === undefined ? {} : { endedMs: live.endedMs }),
   }
@@ -1148,24 +1158,26 @@ async function clean($: EngineInterface, project: Project, removed: readonly str
     }
   }
 
-  await editLegacy($, edit)
+  await editLegacy($, edit, project.legacy.nextId)
 }
 
 /**
  * Applies `edit` to 0.1.4's value as it stands just before, its count raised
  * to this session's; with nothing else to change, raises the count alone,
- * while a 0.1.4 session alive here numbers its tasks from it. A 0.1.4
- * session writing in between is the race 0.1.4 always had among its own.
+ * while a 0.1.4 session alive here numbers its tasks from it, and only past
+ * the count as it was just read (`readCount`). A 0.1.4 session writing in
+ * between is the race 0.1.4 always had among its own.
  */
-async function editLegacy($: EngineInterface, edit: LegacyEdit) {
+async function editLegacy($: EngineInterface, edit: LegacyEdit, readCount = 0) {
   const key = keysOf(live.root).legacy
+  const count = await read($, nextId)
 
-  if (key === undefined || (isEmptyEdit(edit) && !live.hasLegacyPeer)) {
+  if (key === undefined || (isEmptyEdit(edit) && (!live.hasLegacyPeer || count <= readCount))) {
     return
   }
 
   const current = legacyOf(await $.store.get(key))
-  const edited = editedLegacy(current, edit, await read($, nextId), await $.clock.now())
+  const edited = editedLegacy(current, edit, count, await $.clock.now())
 
   if (!isEmptyEdit(edit) || edited.nextId > current.nextId) {
     await $.store.set(key, edited)

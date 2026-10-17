@@ -110,6 +110,9 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     unstick: undefined as (() => void) | undefined,
     /** How long the plugin's store writes take. */
     setMs: 0,
+    /** Set, the plugin's next read of this value of its state answers `readMs` late, with the value as it stood when asked. */
+    slowRead: undefined as string | undefined,
+    readMs: 0,
     /** Set, a hook beneath takes the context out of the user's typed prompts. */
     isStripping: false,
     /** Set, a hook beneath rewrites the user's typed prompts and their context with it (masks a secret, say). */
@@ -169,6 +172,17 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     }
 
     return refused('keys') ?? { value: Object.keys(world.store) }
+  })
+
+  on('state.get', { plugin: 'human-in-the-loop' }, async ($, e, next) => {
+    const read = await next(e)
+
+    if (e.key === world.slowRead) {
+      world.slowRead = undefined
+      await clock.sleep(world.readMs)
+    }
+
+    return read
   })
 
   on('session.id', () => ({ value: world.sessionId }))
@@ -1094,6 +1108,7 @@ describe('across sessions', () => {
       'tasks:/repo': {
         nextId: 8,
         tasks: [
+          null,
           {
             id: 7,
             title: 'Rotate the leaked token in Vault',
@@ -1405,6 +1420,29 @@ describe('across sessions', () => {
 
     expect(world.toasts.at(-1)).toBe('Another session in this project took on task #2 while this one was away. Answer it there.')
     expect(world.status).toBe('☐ 1 task for you · /my-tasks')
+  })
+
+  test('a press while a heartbeat lets tasks go is kept', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    takeOn(world.store, [2])
+    // The heartbeat reads the task list late: Done on #1 lands meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    await clock.advance(60_000)
+    const pressed = ui.press({ key: 'done' })
+    await clock.advance(500)
+    await pressed
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(world.toasts).toContain('Another session in this project took on task #2 while this one was away. Answer it there.')
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Add STRIPE_SECRET_KEY to .env: Done.'])
+    expect(world.status).toBe('1 task in another session')
   })
 
   test('Claude withdrawing, on waking, a task another session took on meanwhile is told it is gone', async ($, on) => {
@@ -1746,6 +1784,30 @@ describe('across sessions', () => {
     expect(Object.values(slotsIn(world.store)).flatMap(slot => slot.tasks)).toEqual([])
   })
 
+  test('after /clear, a press while the session it becomes takes the tasks on is kept', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    const ui = await $.ui.mount(PANE)
+    world.sessionId = 'session-2'
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    // Taking the tasks on, the new session reads its task list late: Done lands meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    await clock.advance(1)
+    const pressed = ui.press({ key: 'done' })
+    await clock.advance(500)
+    await pressed
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Add STRIPE_SECRET_KEY to .env: Done.'])
+    expect(world.status).toBeUndefined()
+    expect(Object.keys(slotsIn(world.store))).toEqual(['session-2'])
+    expect(slotsIn(world.store)['session-2']?.tasks).toEqual([])
+  })
+
   test('after two /clears, the first never reading the project, the third session takes the tasks on once', async ($, on) => {
     const { world, clock } = seat(on)
     await start($)
@@ -1818,6 +1880,30 @@ describe('across sessions', () => {
     expect(world.status).toBe('☐ 1 task for you · /my-tasks')
   })
 
+  test('a slot that leaves as this session takes it on hands its own notes on, so nothing it took is taken twice', async ($, on) => {
+    const held = { ...ROTATE, sessionId: 'session-q' }
+    const note = { tasks: [refOf(held)], atMs: NOW - 5 * 60_000 }
+    // Session x took #7 on from quiet session q, and ended holding it.
+    const { world, clock } = seat(on, {
+      [KEYS.session('session-q')]: { tasks: [held], seenMs: NOW - 10 * 60_000, nextId: 8 },
+      [KEYS.session('session-x')]: { tasks: [held], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 8, took: { 'session-q': note } },
+    })
+    await start($)
+
+    expect(world.status).toBe('☐ 1 task for you · /my-tasks')
+    expect(Object.keys(slotsIn(world.store)).sort()).toEqual(['session-1', 'session-q'])
+    expect(slotsIn(world.store)['session-1']?.took?.['session-q']).toEqual(note)
+
+    // After /clear, the session it becomes takes this one's task on, and not q's again.
+    world.sessionId = 'session-2'
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    await clock.advance(1)
+    await clock.settle()
+
+    expect(world.status).toBe('☐ 1 task for you · /my-tasks')
+    expect(slotsIn(world.store)['session-2']?.tasks.map(task => task.id)).toEqual([7])
+  })
+
   test("a slot or a note in 0.1.4's value that isn't one is skipped", async ($, on) => {
     const quiet = { ...ROTATE, id: 8, title: 'Approve the staging migration', sessionId: 'session-y' }
     const { world } = seat(on, {
@@ -1840,14 +1926,78 @@ describe('across sessions', () => {
     expect(String((assigned as { result?: unknown }).result)).toContain('Assigned task #9')
   })
 
-  test("a note in a slot that isn't one is skipped", async ($, on) => {
+  test("what in a slot isn't a task, a count or a note is skipped", async ($, on) => {
+    const elsewhere = { ...ROTATE, id: 5, title: 'Approve the staging migration', sessionId: 'session-z' }
     const { world } = seat(on, {
-      [KEYS.session('session-0')]: { tasks: [ROTATE], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 8, took: { 'session-x': {} } },
+      [KEYS.session('session-0')]: {
+        tasks: [ROTATE, null, { id: 9 }],
+        seenMs: NOW - 60_000,
+        endedMs: NOW - 60_000,
+        nextId: 'ten',
+        took: { 'session-x': {}, 'session-z': { tasks: [null], atMs: NOW - 60_000 } },
+      },
+      [KEYS.session('session-z')]: { tasks: [elsewhere], seenMs: NOW, nextId: 6 },
+    })
+    await start($)
+
+    expect(world.status).toBe('☐ 1 task for you · /my-tasks · 1 task in another session')
+    expect(Object.keys(slotsIn(world.store)).sort()).toEqual(['session-1', 'session-z'])
+    expect((world.store[MINE] as { nextId?: unknown }).nextId).toBe(8)
+
+    const assigned = await $.tool.call(KEY_TASK)
+    expect(String((assigned as { result?: unknown }).result)).toContain('Assigned task #8')
+  })
+
+  test("a slot that leaves takes with it the copy of it 0.1.4's value kept", async ($, on) => {
+    const answered = { ...ROTATE, id: 6, title: 'Approve the staging migration', sessionId: 'session-s' }
+    const held = { ...ROTATE, sessionId: 'session-s' }
+    // Session s came to this version from 0.1.4, and a 0.1.4 session's write put its slot back as it was then.
+    const { world } = seat(on, {
+      'tasks:/repo': { nextId: 8, sessions: { 'session-s': { tasks: [answered, held], seenMs: NOW - 60 * 60_000 } }, taken: {} },
+      [KEYS.session('session-s')]: { tasks: [held], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 8 },
     })
     await start($)
 
     expect(world.status).toBe('☐ 1 task for you · /my-tasks')
     expect(Object.keys(slotsIn(world.store))).toEqual(['session-1'])
+    expect(world.store['tasks:/repo']).toEqual({ nextId: 8, sessions: {}, taken: {} })
+  })
+
+  test("a slot left behind that leaves on the heartbeat takes 0.1.4's copy of it too", async ($, on) => {
+    const held = { ...ROTATE, sessionId: 'session-s' }
+    const left = { tasks: [held], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 8 }
+    const { world, clock } = seat(on, { [KEYS.session('session-s')]: left })
+    await start($)
+
+    // The removal didn't stay, and a 0.1.4 session's write put back the copy its value had of session s.
+    world.store[KEYS.session('session-s')] = left
+    world.store['tasks:/repo'] = { nextId: 8, sessions: { 'session-s': { tasks: [held], seenMs: NOW - 60 * 60_000 } }, taken: {} }
+    await clock.advance(60_000)
+    await clock.settle()
+
+    expect(Object.keys(slotsIn(world.store))).toEqual(['session-1'])
+    expect(world.store['tasks:/repo']).toEqual({ nextId: 8, sessions: {}, taken: {} })
+    expect(world.status).toBe('☐ 1 task for you · /my-tasks')
+  })
+
+  test("with a 0.1.4 session alive, a heartbeat reads its value once, and raises its count only when it fell back", async ($, on) => {
+    const { world, clock } = seat(on, { 'tasks:/repo': { nextId: 8, sessions: { 'session-0': { tasks: [ROTATE], seenMs: NOW } }, taken: {} } })
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    world.ops = []
+    await clock.advance(60_000)
+    await clock.settle()
+
+    expect(world.ops.filter(op => op === 'get tasks:/repo')).toEqual(['get tasks:/repo'])
+    expect((world.store['tasks:/repo'] as { nextId: number }).nextId).toBe(9)
+
+    // A 0.1.4 session's write puts back the count it read before.
+    world.store['tasks:/repo'] = { nextId: 8, sessions: { 'session-0': { tasks: [ROTATE], seenMs: NOW + 60_000 } }, taken: {} }
+    await clock.advance(60_000)
+    await clock.settle()
+
+    expect((world.store['tasks:/repo'] as { nextId: number }).nextId).toBe(9)
   })
 
   test("a slot of another folder whose key starts as this one's is not this project's", async ($, on) => {

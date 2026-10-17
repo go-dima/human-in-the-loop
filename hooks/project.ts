@@ -92,23 +92,42 @@ function hashOf(text: string): string {
   return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)
 }
 
+/** Whether a stored value is an object with an array under `list` and a number under `count`: a slot's shape, and a note's. */
+function isShaped(value: unknown, list: string, count: string): value is Record<string, unknown> {
+  const record = value as Record<string, unknown> | null
+
+  return record !== null && typeof record === 'object' && Array.isArray(record[list]) && typeof record[count] === 'number'
+}
+
 /** Whether a stored value is a slot: anything else under a slot's key is skipped. */
 export function isSlot(value: unknown): value is Slot {
-  const slot = value as Partial<Slot> | null
-
-  return slot !== null && typeof slot === 'object' && Array.isArray(slot.tasks) && typeof slot.seenMs === 'number'
+  return isShaped(value, 'tasks', 'seenMs')
 }
 
 function isNote(value: unknown): value is Note {
-  const note = value as Partial<Note> | null
-
-  return note !== null && typeof note === 'object' && Array.isArray(note.ids) && typeof note.atMs === 'number'
+  return isShaped(value, 'ids', 'atMs')
 }
 
-function isTook(value: unknown): value is Took {
-  const note = value as Partial<Took> | null
+/** Whether a stored value is a task, as the pane and the project's reckoning read one. */
+function isTask(value: unknown): value is Task {
+  const task = value as Record<string, unknown> | null
+  const isText = (key: string) => typeof task?.[key] === 'string'
+  const options = task?.['options']
 
-  return note !== null && typeof note === 'object' && Array.isArray(note.tasks) && typeof note.atMs === 'number'
+  return (
+    task !== null &&
+    typeof task === 'object' &&
+    ['id', 'createdMs', 'updatedMs'].every(key => typeof task[key] === 'number') &&
+    ['title', 'why', 'kind', 'state', 'update', 'sessionId'].every(isText) &&
+    ['doneWhen', 'answer', 'reason'].every(key => task[key] === undefined || isText(key)) &&
+    (options === undefined || (Array.isArray(options) && options.every(option => typeof option === 'string')))
+  )
+}
+
+function isRef(value: unknown): value is TaskRef {
+  const ref = value as Partial<TaskRef> | null
+
+  return ref !== null && typeof ref === 'object' && typeof ref.id === 'number' && typeof ref.createdMs === 'number'
 }
 
 /** The entries of a stored record as `of` reads them; one it reads as nothing is skipped. */
@@ -126,13 +145,28 @@ function entriesOf<T>(raw: unknown, of: (value: unknown) => T | undefined): Reco
   return read
 }
 
-/** A stored value as a slot, less any note in it that isn't one; nothing when it isn't a slot. */
+/** A stored value as a note of tasks taken, less what in it isn't one; nothing when it isn't a note. */
+function tookIn(value: unknown): Took | undefined {
+  if (!isShaped(value, 'tasks', 'atMs')) {
+    return undefined
+  }
+
+  return { tasks: (value.tasks as unknown[]).filter(isRef), atMs: value.atMs as number, ...(value.isEnded === true ? { isEnded: true } : {}) }
+}
+
+/** A stored value as a slot, less what in it isn't a task, a count or a note; nothing when it isn't a slot. */
 function slotIn(value: unknown): Slot | undefined {
   if (!isSlot(value)) {
     return undefined
   }
 
-  return value.took === undefined ? value : { ...value, took: entriesOf(value.took, note => (isTook(note) ? note : undefined)) }
+  return {
+    tasks: value.tasks.filter(isTask),
+    seenMs: value.seenMs,
+    ...(typeof value.endedMs === 'number' ? { endedMs: value.endedMs } : {}),
+    ...(typeof value.nextId === 'number' ? { nextId: value.nextId } : {}),
+    ...(value.took === undefined ? {} : { took: entriesOf(value.took, tookIn) }),
+  }
 }
 
 /** Reads 0.1.4's value, its first layout (one list for the project) included. */
@@ -149,7 +183,7 @@ export function legacyOf(raw: unknown): Legacy {
   // that have ended.
   const sessions: Record<string, Slot> = {}
 
-  for (const task of Array.isArray(value.tasks) ? (value.tasks as Task[]) : []) {
+  for (const task of Array.isArray(value.tasks) ? value.tasks.filter(isTask) : []) {
     const slot = (sessions[task.sessionId] ??= { tasks: [], seenMs: 0, endedMs: 0 })
     slot.tasks.push(task)
   }
@@ -262,6 +296,18 @@ function merged(one: Took | undefined, other: Took): Took {
 }
 
 /**
+ * Carries a slot's notes of what its session took into `into`, but for a
+ * note of tasks taken from `sessionId`: those it holds itself again.
+ */
+function carry(into: Record<string, Took>, notes: Slot['took'], sessionId: string) {
+  for (const [from, note] of Object.entries(notes ?? {})) {
+    if (from !== sessionId) {
+      into[from] = merged(into[from], note)
+    }
+  }
+}
+
+/**
  * The session's own leftovers in 0.1.4's value, to take out: its slot, from
  * before a hot reload into this version, and a note another session left it.
  */
@@ -270,6 +316,17 @@ function ownLegacy(project: Project, sessionId: string): LegacyEdit {
     removed: sessionId in project.legacy.sessions ? [sessionId] : [],
     taken: {},
     ...(sessionId in project.legacy.taken ? { read: sessionId } : {}),
+  }
+}
+
+/**
+ * Takes a slot that leaves the store out of 0.1.4's value too, where a 0.1.4
+ * session's write put back the copy of it from before its session came to
+ * this version: with the slot gone, the copy would pass for it.
+ */
+function dropLegacyCopy(project: Project, id: string, legacy: LegacyEdit) {
+  if (id in project.legacy.sessions && !legacy.removed.includes(id)) {
+    legacy.removed.push(id)
   }
 }
 
@@ -290,7 +347,8 @@ export type Adoption = {
  * of a session that is gone. Live sessions keep theirs, and so does a quiet
  * one with tasks: if it comes back, it reads the note and lets them go. An
  * ended session's slot is removed once the taker's is written, its notes
- * carried over; so is an empty slot, its count carried in the taker's.
+ * carried over; so is an empty slot, its count carried in the taker's. Each
+ * takes with it any copy of it that 0.1.4's value still has.
  *
  * Two sessions assigning at the same moment can draw one number (the store
  * has no way to reserve one): where their tasks meet here, the session's own
@@ -320,10 +378,7 @@ export function adopt(project: Project, sessionId: string, nowMs: number): Adopt
 
     if (id === sessionId) {
       // Resumed: what it took before, it still holds.
-      for (const [from, note] of Object.entries(slot.took ?? {})) {
-        took[from] = merged(took[from], note)
-      }
-
+      carry(took, slot.took, sessionId)
       continue
     }
 
@@ -336,12 +391,8 @@ export function adopt(project: Project, sessionId: string, nowMs: number): Adopt
     if (id in project.slots) {
       if (isEnded || slot.tasks.length === 0) {
         removed.push(id)
-
-        for (const [from, note] of Object.entries(slot.took ?? {})) {
-          if (from !== sessionId) {
-            took[from] = merged(took[from], note)
-          }
-        }
+        carry(took, slot.took, sessionId)
+        dropLegacyCopy(project, id, legacy)
       }
 
       continue
@@ -368,8 +419,9 @@ export function adopt(project: Project, sessionId: string, nowMs: number): Adopt
  * the session it took from let go of the tasks, or it ended and its slot is
  * gone, or the note is a month old. A slot left behind (an ended session's,
  * whose removal didn't happen, or a quiet one's that never came back in a
- * month) is removed now, its note kept until it is gone and its own notes
- * carried over; so are the session's own leftovers in 0.1.4's value.
+ * month) is removed now, with any copy of it in 0.1.4's value, its note
+ * kept until it is gone and its own notes carried over; so are the
+ * session's own leftovers in 0.1.4's value.
  */
 export function prune(
   project: Project,
@@ -406,13 +458,10 @@ export function prune(
     if (slot.seenMs <= note.atMs && (note.isEnded === true || isExpired || !(id in project.slots))) {
       if (id in project.slots) {
         removed.push(id)
+        dropLegacyCopy(project, id, legacy)
 
         // What it took on from others, it may hold yet: its notes go on here.
-        for (const [from, other] of Object.entries(slot.took ?? {})) {
-          if (from !== sessionId) {
-            keep(from, other)
-          }
-        }
+        carry(kept, slot.took, sessionId)
       } else {
         legacy.removed.push(id)
 

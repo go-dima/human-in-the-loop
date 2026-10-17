@@ -105,21 +105,44 @@ function isNote(value: unknown): value is Note {
   return note !== null && typeof note === 'object' && Array.isArray(note.ids) && typeof note.atMs === 'number'
 }
 
-/** The entries of a stored record that are what `is` asks for; anything else in it is skipped. */
-function entriesOf<T>(raw: unknown, is: (value: unknown) => value is T): Record<string, T> {
-  const entries = raw !== null && typeof raw === 'object' ? Object.entries(raw) : []
+function isTook(value: unknown): value is Took {
+  const note = value as Partial<Took> | null
 
-  return Object.fromEntries(entries.filter((entry): entry is [string, T] => is(entry[1])))
+  return note !== null && typeof note === 'object' && Array.isArray(note.tasks) && typeof note.atMs === 'number'
+}
+
+/** The entries of a stored record as `of` reads them; one it reads as nothing is skipped. */
+function entriesOf<T>(raw: unknown, of: (value: unknown) => T | undefined): Record<string, T> {
+  const read: Record<string, T> = {}
+
+  for (const [key, value] of raw !== null && typeof raw === 'object' ? Object.entries(raw) : []) {
+    const entry = of(value)
+
+    if (entry !== undefined) {
+      read[key] = entry
+    }
+  }
+
+  return read
+}
+
+/** A stored value as a slot, less any note in it that isn't one; nothing when it isn't a slot. */
+function slotIn(value: unknown): Slot | undefined {
+  if (!isSlot(value)) {
+    return undefined
+  }
+
+  return value.took === undefined ? value : { ...value, took: entriesOf(value.took, note => (isTook(note) ? note : undefined)) }
 }
 
 /** Reads 0.1.4's value, its first layout (one list for the project) included. */
 export function legacyOf(raw: unknown): Legacy {
   const value = (raw ?? {}) as { nextId?: unknown; sessions?: unknown; tasks?: unknown; taken?: unknown }
   const nextId = typeof value.nextId === 'number' ? value.nextId : 1
-  const taken = entriesOf(value.taken, isNote)
+  const taken = entriesOf(value.taken, note => (isNote(note) ? note : undefined))
 
   if (value.sessions !== null && typeof value.sessions === 'object') {
-    return { nextId, sessions: entriesOf(value.sessions, isSlot), taken }
+    return { nextId, sessions: entriesOf(value.sessions, slotIn), taken }
   }
 
   // The first layout kept one list per project: its tasks belong to sessions
@@ -134,14 +157,21 @@ export function legacyOf(raw: unknown): Legacy {
   return { nextId, sessions, taken: {} }
 }
 
-/** A project from the store's values, by key. */
+/**
+ * A project from the store's values, by key. A session id has no `#`: a key
+ * past the prefix that has one is another root's, whose path goes on with
+ * `#session:`.
+ */
 export function projectOf(root: string, values: Readonly<Record<string, unknown>>): Project {
   const keys = keysOf(root)
   const slots: Record<string, Slot> = {}
 
   for (const [key, value] of Object.entries(values)) {
-    if (key.startsWith(keys.prefix) && isSlot(value)) {
-      slots[key.slice(keys.prefix.length)] = value
+    const id = key.startsWith(keys.prefix) ? key.slice(keys.prefix.length) : '#'
+    const slot = id.includes('#') ? undefined : slotIn(value)
+
+    if (slot !== undefined) {
+      slots[id] = slot
     }
   }
 

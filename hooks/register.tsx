@@ -844,7 +844,7 @@ async function join($: EngineInterface) {
   // it starts on this one as a new process would. A store that fails now
   // takes nothing on yet: the session writes nothing until it has read the
   // project, which the heartbeat tries again.
-  await queued(async () => {
+  const joined = queued(async () => {
     if (live.root !== '' && live.root !== root) {
       await update($, tasks, () => [])
       await update($, nextId, () => 1)
@@ -863,16 +863,23 @@ async function join($: EngineInterface) {
     live.endedMs = undefined
 
     return load($)
-  }).catch(() => undefined)
+  })
+    .catch(() => undefined)
+    .then(async () => {
+      // Tasks from an earlier session: the status line says so, and the pane
+      // opens where the terminal is wide enough to seat it unasked.
+      if (await refresh($)) {
+        await show($, false)
+      }
+    })
+    .catch(() => undefined)
 
   live.heartbeat?.cancel()
   live.heartbeat = $.clock.every(HEARTBEAT_MS, () => void beat($))
 
-  // Tasks from an earlier session: the status line says so, and the pane
-  // opens where the terminal is wide enough to seat it unasked.
-  if (await refresh($)) {
-    await show($, false)
-  }
+  // A store slow to answer holds up the start 5 seconds at most: what the
+  // session takes on shows once it answers.
+  await awaited($, joined)
 }
 
 /**
@@ -936,8 +943,9 @@ async function isLoaded($: EngineInterface): Promise<boolean> {
  * leaves once this session's is written. Held for none (no session of the
  * process has read the project), it is the tasks its sessions assigned, each
  * beside those the store holds for the session that assigned it, which has
- * ended unless it is this one, or another process has resumed it since: then
- * this one holds them.
+ * ended unless it is this one or the store says otherwise: alive, another
+ * process has resumed it since, and this one holds them; quiet, it may come
+ * back, and lets them go then.
  */
 function withHeld(project: Project, holder: string | null, slot: Slot, nowMs: number): Project {
   if (holder !== null) {
@@ -956,9 +964,10 @@ function withHeld(project: Project, holder: string | null, slot: Slot, nowMs: nu
   for (const task of slot.tasks) {
     const stored = project.all[task.sessionId]
     // A session of the process that another has resumed since keeps its
-    // slot, which this process never wrote: what it held goes on in this one's.
+    // slot, which this process never wrote: what it held goes on in this
+    // one's. A quiet one may come back: it ends only as the store says.
     const id = stored === undefined || isGone(stored, nowMs) ? task.sessionId : own
-    const into = (slots[id] ??= { seenMs: 0, ...project.all[id], tasks: [], ...(id === own ? {} : { endedMs: nowMs }) })
+    const into = (slots[id] ??= { seenMs: 0, ...project.all[id], tasks: [], ...(id === own || id in project.all ? {} : { endedMs: nowMs }) })
 
     into.tasks.push(task)
   }
@@ -1133,8 +1142,10 @@ async function readProject($: EngineInterface): Promise<Project> {
  * key it writes. A session that never held a task has no slot, unless
  * `isForced`: its count must be in the store before a slot that carries one
  * leaves it. One that has a slot keeps it, its count in it, until it ends,
- * and the next session in the project removes it. A session that hasn't
- * read the project writes nothing: it would write over tasks of its own.
+ * and the next session in the project removes it; it has one from the first
+ * write it makes, landed or not, since a write that fails, the next one
+ * makes, its tasks gone by then or not. A session that hasn't read the
+ * project writes nothing: it would write over tasks of its own.
  */
 async function writeOwn($: EngineInterface, isForced = false) {
   if (!(await isLoaded($))) {
@@ -1148,8 +1159,8 @@ async function writeOwn($: EngineInterface, isForced = false) {
     return
   }
 
-  await $.store.set(keysOf(live.root).session(live.sessionId), slot)
   live.hasSlot = true
+  await $.store.set(keysOf(live.root).session(live.sessionId), slot)
   live.writtenMs = nowMs
 }
 
@@ -1194,13 +1205,14 @@ async function clean($: EngineInterface, project: Project, removed: readonly str
  * to this session's; with nothing else to change, raises the count alone,
  * while a 0.1.4 session alive here numbers its tasks from it, and only past
  * the count as it was just read (`readCount`). A 0.1.4 session writing in
- * between is the race 0.1.4 always had among its own.
+ * between is the race 0.1.4 always had among its own. A session that hasn't
+ * read the project changes nothing there.
  */
 async function editLegacy($: EngineInterface, edit: LegacyEdit, readCount = 0) {
   const key = keysOf(live.root).legacy
   const count = await read($, nextId)
 
-  if (key === undefined || (isEmptyEdit(edit) && (!live.hasLegacyPeer || count <= readCount))) {
+  if (key === undefined || !(await isLoaded($)) || (isEmptyEdit(edit) && (!live.hasLegacyPeer || count <= readCount))) {
     return
   }
 

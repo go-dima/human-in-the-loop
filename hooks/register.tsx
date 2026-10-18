@@ -300,10 +300,14 @@ const live = {
   seats: new Map<RenderSurface, readonly Seat[]>(),
   /** Surfaces a client left while others stay: the next drawing there starts their seats over. */
   startingOver: new Set<RenderSurface>(),
+  /** How many times each surface's last client has left: a drawing under way as one did keeps no seat there. */
+  emptied: new Map<RenderSurface, number>(),
   /** The key of the element the pane's focus ring last moved onto. */
   ring: undefined as string | undefined,
   /** The rows the pane last asked for. */
   rows: 0,
+  /** The re-sizes keys and ring moves asked for and not yet done: each waits for the one before (see `refit`). */
+  refitQueue: Promise.resolve() as Promise<unknown>,
 }
 
 /** Whether Claude is at work: the engine's word when it has given one, else the turns begun and not ended. */
@@ -707,6 +711,7 @@ export const register: Register = on => {
         live.startingOver.add(e.surface)
       } else {
         live.seats.delete(e.surface)
+        live.emptied.set(e.surface, (live.emptied.get(e.surface) ?? 0) + 1)
       }
 
       return { ...all, [e.surface]: left }
@@ -729,6 +734,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const emptied = live.emptied.get(e.surface)
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements
     // The mobile app draws no field yet: answers and reasons wait for a surface
@@ -744,10 +750,15 @@ export const register: Register = on => {
     const seat: Seat = { columns, canType: view.canType, isFocused: view.isFocused, isInline: e.props.placement === 'inline' }
     // Drawn by two clients, a surface keeps how each drew it, or each one's
     // drawing would resize the pane against the other's: as a render names
-    // neither, every way it was drawn since a client came or went.
+    // neither, every way it was drawn since a client came or went. One drawn
+    // as the surface's last client left keeps no seat, which nothing there
+    // would draw again to take back.
     const isShared = ((await read($, clients))[e.surface]?.length ?? 0) > 1
-    const kept = live.startingOver.delete(e.surface) ? [] : (live.seats.get(e.surface) ?? [])
-    live.seats.set(e.surface, isShared ? seatsWith(kept, seat) : [seat])
+
+    if (live.emptied.get(e.surface) === emptied) {
+      const kept = live.startingOver.delete(e.surface) ? [] : (live.seats.get(e.surface) ?? [])
+      live.seats.set(e.surface, isShared ? seatsWith(kept, seat) : [seat])
+    }
 
     const { shown, editing: field, isWorking: working } = view
 
@@ -1608,17 +1619,25 @@ async function fit($: EngineInterface, wanted?: number) {
 /**
  * Re-sizes an inline pane whose rows changed with what nothing draws it
  * again for: a draft growing, the ring moving onto its field or off it.
+ * One at a time, in the order asked: each reads the draft and the ring once
+ * the one before has asked for its rows, so the last asks for what the last
+ * key or move left.
  */
-async function refit($: EngineInterface) {
-  if (inlineSeats().length === 0) {
-    return
-  }
+function refit($: EngineInterface): Promise<void> {
+  const done = live.refitQueue.then(async () => {
+    if (inlineSeats().length === 0) {
+      return
+    }
 
-  const rows = await rowsWanted($)
+    const rows = await rowsWanted($)
 
-  if (rows !== live.rows) {
-    await fit($, rows)
-  }
+    if (rows !== live.rows) {
+      await fit($, rows)
+    }
+  })
+  live.refitQueue = done.catch(() => undefined)
+
+  return done
 }
 
 /**

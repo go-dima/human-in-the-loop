@@ -791,6 +791,31 @@ describe('long titles', () => {
     expect(world.opens.at(-1)?.rows).toBe(17)
   })
 
+  test('the last client of a surface leaving as it draws the pane, the pane asks for none of the rows that drawing takes', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    const terminal = await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The phone draws the pane again and leaves before that drawing reads who is attached.
+    world.slowRead = 'clients'
+    world.readMs = 100
+    const drawing = mobile.redraw(inline(32).props)
+    await clock.settle()
+    await mobile.unmount()
+    await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.advance(100)
+    await drawing.catch(() => undefined)
+
+    await terminal.redraw(inline(60).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
   test('a client is counted before it first draws the pane', async ($, on) => {
     const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
     await start($)
@@ -1252,6 +1277,57 @@ describe('the answer field', () => {
     await $.ui.focus(ringTo('long'))
     await clock.settle()
     await again.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with rounding', kind: 'change' })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+  })
+
+  test('opened again, a field takes the ring and asks for the rows its draft wraps to', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(60))
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+    await ui.input({
+      key: 'answer-1',
+      text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error',
+      kind: 'change',
+    })
+    await $.ui.focus(ringTo('other-way'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    await ui.press({ key: 'cancel' })
+    await ui.press({ key: 'answer' })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+  })
+
+  test('a key typed as a move of the ring re-sizes the pane, the pane asks for the rows the key leaves', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(60))
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed', kind: 'change' })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    // Tab moves the keys on, and that re-size reads slowly once it has the
+    // draft; the person comes back to the field and types meanwhile.
+    world.slowRead = 'isWorking'
+    world.readMs = 100
+    await $.ui.focus(ringTo('other-way'))
+    await clock.settle()
+    const typing = ui.input({
+      key: 'answer-1',
+      text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error',
+      kind: 'change',
+    })
+    await clock.settle()
+    await clock.advance(100)
+    await typing
+    await clock.settle()
     expect(world.opens.at(-1)?.rows).toBe(rows + 2)
   })
 

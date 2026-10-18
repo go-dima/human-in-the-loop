@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PromptSubmitResult, Register, RenderElement, RenderSurface, Timer, ToolSpec } from 'claude-code'
+import type { EngineInterface, PromptSubmitResult, Register, RenderElement, RenderSurface, StateValue, Timer, ToolSpec } from 'claude-code'
 
 import type { Editing, Task, Took } from '../types'
 import {
@@ -205,8 +205,8 @@ const selectedId = atom({ plugin: 'human-in-the-loop', key: 'selectedId' } as co
 const editing = atom({ plugin: 'human-in-the-loop', key: 'editing' } as const, null as Editing | null)
 const loadedFor = atom({ plugin: 'human-in-the-loop', key: 'loadedFor' } as const, null as string | null)
 const isWorking = atom({ plugin: 'human-in-the-loop', key: 'isWorking' } as const, false)
-/** The remote clients attached, by surface: two phones are two clients on one. */
-type Roster = Readonly<Partial<Record<RenderSurface, readonly string[]>>>
+/** The remote clients attached, by surface, as the state's contract declares them. */
+type Roster = StateValue<'human-in-the-loop', 'clients'>
 /** The roster, kept where a reload of the code finds it. */
 const clients = atom({ plugin: 'human-in-the-loop', key: 'clients' } as const, {} as Roster)
 

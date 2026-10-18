@@ -1465,7 +1465,7 @@ describe('across sessions', () => {
     expect(world.status).toBe('1 task in another session')
   })
 
-  test('a resumed session whose task was taken back while it was gone holds nothing, and writes nothing as it joins', async ($, on) => {
+  test('a resumed session whose task was taken back while it was gone holds nothing, and notes nothing as it joins', async ($, on) => {
     const held = { ...ROTATE, sessionId: 'session-r' }
     // This session took #7 on from session r, went quiet, and r, resumed, took it back.
     const { world } = seat(on, {
@@ -1475,7 +1475,16 @@ describe('across sessions', () => {
     await start($)
 
     expect(world.status).toBe('1 task in another session')
-    expect(world.ops).not.toContain(`set ${MINE}`)
+    expect(slotsIn(world.store)['session-1']).toEqual({ tasks: [], seenMs: NOW, nextId: 8 })
+  })
+
+  test('a resumed session that holds nothing marks its slot alive as it joins, its count in it', async ($, on) => {
+    const { world } = seat(on, {
+      [MINE]: { tasks: [], seenMs: NOW - 10 * 60_000, nextId: 8, endedMs: NOW - 10 * 60_000 },
+    })
+    await start($)
+
+    expect(slotsIn(world.store)['session-1']).toEqual({ tasks: [], seenMs: NOW, nextId: 8 })
   })
 
   test("a 0.1.4 session's end counts at once, however recently it wrote", async ($, on) => {

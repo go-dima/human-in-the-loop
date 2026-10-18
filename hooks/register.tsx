@@ -934,6 +934,7 @@ async function load($: EngineInterface) {
   })
 
   live.readMs = nowMs
+  live.hasSlot ||= live.sessionId in stored.slots
   await update($, nextId, n => Math.max(n, adoption.nextId))
   await update($, took, () => adoption.took)
   await update($, loadedFor, () => live.sessionId)

@@ -1938,6 +1938,13 @@ async function stopEditing($: EngineInterface) {
 /** Moves a long answer into the prompt box, where the real editor takes pastes and lines. */
 async function longAnswer($: EngineInterface, id: number) {
   const key = fieldKeyOf({ id, field: 'answer' })
+
+  // Pressed on a drawing from before its task closed, it answers as the
+  // button beside it would: the task isn't open any more.
+  if (!(await read($, tasks)).some(task => task.id === id && isActive(task))) {
+    return answer($, id, live.closed.get(key) ?? '', 'later')
+  }
+
   const box = await $.prompt.read()
   const draft = live.drafts.get(key) ?? ''
   const text = bridgeOf(id) + [draft, box.text].filter(part => part.trim() !== '').join('\n')

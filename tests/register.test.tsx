@@ -1996,6 +1996,27 @@ describe('responding', () => {
     expect(world.composer).toBe('LoginTests.testExpiredToken failed')
   })
 
+  test('Long answer… pressed as Claude withdraws its task says the task is gone, and puts what was typed in the prompt box', async ($, on) => {
+    const { world, clock } = seat(on)
+    const held = holdingPresses(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await clock.settle()
+    held.isOn = true
+    const pressed = ui.press({ key: 'long' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    held.letGo()
+    await pressed
+
+    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved. What you typed is in the prompt box.")
+    expect(world.composer).toBe('LoginTests.testExpiredToken failed')
+  })
+
   test('Save for later pressed as the same answer lands from the prompt box says nothing, as a second press does', async ($, on) => {
     const { world, clock } = seat(on)
     const held = holdingPresses(on)

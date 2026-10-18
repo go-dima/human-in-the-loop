@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PromptSubmitResult, Register, Timer, ToolSpec } from 'claude-code'
+import type { EngineInterface, PromptSubmitResult, Register, RenderSurface, Timer, ToolSpec } from 'claude-code'
 
 import type { Editing, Task, Took } from '../types'
 import {
@@ -98,6 +98,12 @@ const MOVING = 'This session is still joining its project: the task store is slo
 const PANE = 'my-tasks'
 const PANE_TITLE = 'My tasks'
 const MAX_PANE_ROWS = 18
+
+/** How a surface draws the pane: its body's width, whether it draws a field and holds the keys, and whether it seats the pane inline. */
+type Seat = Pick<PaneView, 'canType' | 'isFocused'> & { columns: number; isInline: boolean }
+
+/** An 80-column terminal's main screen: the pane's seat until a surface draws it. */
+const FIRST_SEAT: Seat = { columns: 76, canType: true, isFocused: false, isInline: true }
 
 const TOOLS: readonly ToolSpec[] = [
   {
@@ -263,15 +269,8 @@ const live = {
   turns: new Set<string>(),
   /** Whether a turn runs, in the engine's own word (the band's `isWorking`), once it has said. */
   engineWorking: undefined as boolean | undefined,
-  /**
-   * The pane's body as last drawn: its width, whether it draws a field and
-   * holds the keys; until it is first drawn, an 80-column terminal's.
-   */
-  columns: 76,
-  canType: true,
-  isFocused: false,
-  /** The pane is seated inline above the prompt, where it asks for the rows it takes. */
-  isInline: false,
+  /** Each surface drawing the pane, by `e.surface`, as it last drew it. */
+  seats: new Map<RenderSurface, Seat>(),
   /** The key of the element the pane's focus ring last moved onto. */
   ring: undefined as string | undefined,
   /** The rows the pane last asked for. */
@@ -658,6 +657,21 @@ export const register: Register = on => {
     )
   })
 
+  // The last of a kind of surface gone, the pane fits the ones left.
+  on('session.detach', async ($, e, next) => {
+    const left = await next(e)
+    const surfaces = await $.session.surfaces()
+
+    for (const surface of live.seats.keys()) {
+      if (!surfaces.includes(surface)) {
+        live.seats.delete(surface)
+      }
+    }
+
+    void refit($)
+    return left
+  })
+
   // The ring on the open field lets the terminal wrap what is typed there:
   // the pane asks for the rows that takes, and for one row once it leaves.
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
@@ -680,12 +694,12 @@ export const register: Register = on => {
     const Input = e.surface !== 'mobile' && 'Input' in elements ? elements.Input : undefined
     const view = await paneView($, { canType: Input !== undefined, isFocused: e.props.isFocused })
 
-    // The pane asks for the rows its tree takes at the width it is drawn in:
-    // a long title wraps, and a pane sized for one row would cut off the rest.
-    live.columns = e.props.bodyColumns
-    live.canType = view.canType
-    live.isFocused = view.isFocused
-    live.isInline = e.props.placement === 'inline'
+    // The pane asks for the rows its tree takes at the width each surface
+    // draws it in: a long title wraps, and a pane sized for one row would cut
+    // off the rest.
+    const columns = e.props.bodyColumns
+    const seat: Seat = { columns, canType: view.canType, isFocused: view.isFocused, isInline: e.props.placement === 'inline' }
+    live.seats.set(e.surface, seat)
 
     const { shown, editing: field, isWorking: working } = view
 
@@ -694,7 +708,7 @@ export const register: Register = on => {
       return <Text dimColor>No tasks for you right now.</Text>
     }
 
-    if (live.isInline && rowsFor(view, live.columns, MAX_PANE_ROWS) !== live.rows) {
+    if (seat.isInline && (await rowsWanted($)) !== live.rows) {
       void fit($)
     }
 
@@ -778,7 +792,7 @@ export const register: Register = on => {
             <Input
               key={key}
               label={ANSWER_LABEL}
-              placeholder={placeholderOf(answerPlaceholderOf(view), ANSWER_LABEL, submitLabel, live.columns)}
+              placeholder={placeholderOf(answerPlaceholderOf(view), ANSWER_LABEL, submitLabel, columns)}
               value={live.opened.get(key) ?? ''}
               submitLabel={submitLabel}
               autoFocus
@@ -814,7 +828,7 @@ export const register: Register = on => {
             <Input
               key={key}
               label={REASON_LABEL}
-              placeholder={placeholderOf(REASON_PLACEHOLDER, REASON_LABEL, submitLabel, live.columns)}
+              placeholder={placeholderOf(REASON_PLACEHOLDER, REASON_LABEL, submitLabel, columns)}
               value={live.opened.get(key) ?? ''}
               submitLabel={submitLabel}
               autoFocus
@@ -1444,7 +1458,7 @@ async function refresh($: EngineInterface): Promise<boolean> {
  * surface seated it: one opened unasked waits on a narrow terminal.
  */
 async function show($: EngineInterface, isAsked: boolean): Promise<boolean> {
-  const rows = rowsFor(await paneView($, live), live.columns, MAX_PANE_ROWS)
+  const rows = await rowsWanted($)
   live.rows = rows
   // The pane is a view of the tasks: one that can't open costs the user a
   // click on /my-tasks, never the task itself.
@@ -1485,12 +1499,27 @@ async function fit($: EngineInterface) {
 
 /**
  * Re-sizes an inline pane whose rows changed with what nothing draws it
- * again for: a draft growing, the ring moving onto its field or off it.
+ * again for: a draft growing, the ring moving onto its field or off it, a
+ * surface leaving.
  */
 async function refit($: EngineInterface) {
-  if (live.isInline && rowsFor(await paneView($, live), live.columns, MAX_PANE_ROWS) !== live.rows) {
+  if ([...live.seats.values()].some(seat => seat.isInline) && (await rowsWanted($)) !== live.rows) {
     await fit($)
   }
+}
+
+/**
+ * The rows the pane asks for: the most it takes on a surface seating it
+ * inline. It is one height on all of them, and each asking for its own
+ * would resize it against the others.
+ */
+async function rowsWanted($: EngineInterface): Promise<number> {
+  const inline = [...live.seats.values()].filter(seat => seat.isInline)
+  const rows = await Promise.all(
+    (inline.length > 0 ? inline : [FIRST_SEAT]).map(async seat => rowsFor(await paneView($, seat), seat.columns, MAX_PANE_ROWS)),
+  )
+
+  return Math.max(...rows)
 }
 
 /** Keeps what the user typed in the field keyed `key`, and the rows it takes. */

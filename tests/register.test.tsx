@@ -1,4 +1,4 @@
-import type { On, PaneOpenArgs, PromptSubmitInput } from 'claude-code'
+import type { On, PaneOpenArgs, PromptSubmitInput, RenderSurface } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 
@@ -85,6 +85,8 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     toasts: [] as string[],
     opens: [] as PaneOpenArgs[],
     isPaneOpen: false,
+    /** The surfaces the session draws on, as `$.session.surfaces()` answers. */
+    surfaces: ['terminal'] as RenderSurface[],
     isNarrow: false,
     status: undefined as string | undefined,
     composer: '',
@@ -198,6 +200,8 @@ function seat(on: On, store: Record<string, unknown> = {}) {
 
   on('session.id', () => ({ value: world.sessionId }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('session.detach', ($, e) => ({ clientId: e.clientId }))
+  on('session.surfaces', () => ({ value: world.surfaces }))
   on('session.root', () => ({ value: world.root }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__human-in-the-loop__${e.name}` } }))
@@ -485,6 +489,41 @@ describe('long titles', () => {
     // The terminal narrows: the titles take more rows, and the pane asks for them.
     await ui.redraw(inline(32).props)
     expect(world.opens.at(-1)?.rows).toBe(18)
+  })
+
+  test('drawn on two surfaces at once, the pane asks for the rows the narrower takes, and keeps them', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    world.surfaces = ['terminal', 'mobile']
+    await start($)
+
+    await runTasks($)
+    const terminal = await $.ui.mount(inline(60))
+    const phone = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // Each draws again: the pane asks for nothing new.
+    const opens = world.opens.length
+    await terminal.redraw(inline(60).props)
+    await phone.redraw(inline(32).props)
+    expect(world.opens.length).toBe(opens)
+
+    // The phone leaves: the pane fits the terminal.
+    world.surfaces = ['terminal']
+    await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
+  test('docked beside the transcript, the terminal asks for no rows of its own', async ($, on) => {
+    const { world } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    world.surfaces = ['terminal', 'mobile']
+    await start($)
+
+    await runTasks($)
+    await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 32 } })
+    await $.ui.mount({ ...inline(60), surface: 'mobile' })
+
+    expect(world.opens.at(-1)?.rows).toBe(12)
   })
 
   test('the last task leaving, the pane closes and asks for no rows as it goes', async ($, on) => {

@@ -660,14 +660,15 @@ export const register: Register = on => {
     live.canType = view.canType
     live.isFocused = view.isFocused
 
-    if (e.props.placement === 'inline' && rowsFor(view, live.columns, MAX_PANE_ROWS) !== live.rows) {
-      void fit($)
-    }
-
     const { shown, editing: field, isWorking: working } = view
 
+    // The pane is closing: it asks for no rows, which would open it again.
     if (shown.length === 0) {
       return <Text dimColor>No tasks for you right now.</Text>
+    }
+
+    if (e.props.placement === 'inline' && rowsFor(view, live.columns, MAX_PANE_ROWS) !== live.rows) {
+      void fit($)
     }
 
     const active = shown.filter(isActive)

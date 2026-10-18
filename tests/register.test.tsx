@@ -467,6 +467,25 @@ describe('long titles', () => {
     expect(world.opens.at(-1)?.rows).toBe(18)
   })
 
+  test('the last task leaving, the pane closes and asks for no rows as it goes', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    const ui = await $.ui.mount(inline(60))
+    const opens = world.opens.length
+    // Drawn empty while the withdraw writes the store, before the pane closes.
+    world.setMs = 1000
+    const withdrawn = $.tool.call({ tool: WITHDRAW, id: 1 })
+    await clock.advance(1)
+    await ui.redraw(inline(60).props)
+    await clock.advance(1000)
+    await withdrawn
+
+    expect(world.opens.length).toBe(opens)
+    expect(world.isPaneOpen).toBe(false)
+  })
+
   test('every open task shows its whole title, wrapping, with its age after it in the same text', async ($, on) => {
     seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
     await start($)

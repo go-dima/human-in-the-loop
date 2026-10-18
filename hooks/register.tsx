@@ -1874,7 +1874,8 @@ async function respond($: EngineInterface, id: number, patch: Pick<Task, 'state'
 /**
  * Puts what was typed for a task that closed in the prompt box, on a line
  * after any draft there, unless it looks like a secret; resolves whether the
- * box took it.
+ * box took it. Text the box ends with already stays as it is: an Enter that
+ * meets a withdraw finds the draft the withdraw put there.
  */
 async function toPromptBox($: EngineInterface, text: string): Promise<boolean> {
   if (text === '' || looksSecret(text)) {
@@ -1882,6 +1883,11 @@ async function toPromptBox($: EngineInterface, text: string): Promise<boolean> {
   }
 
   const box = await $.prompt.read()
+
+  if (box.text.endsWith(text)) {
+    return true
+  }
+
   const filled = await $.prompt.fill({ text: box.text === '' ? text : `\n${text}`, mode: 'append' }).catch(() => ({ isFilled: false }))
 
   return filled.isFilled

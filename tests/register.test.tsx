@@ -1955,6 +1955,30 @@ describe('responding', () => {
     expect(world.toasts.at(-1)).toMatch(/ runs them\. The emu… What you typed is in the prompt box\.$/)
   })
 
+  test('an answer entered as Claude withdraws its task goes to the prompt box once', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await clock.settle()
+    // Enter reads the task list late: Claude withdraws #1 meanwhile, and its
+    // draft goes to the prompt box first.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const entered = ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
+    await clock.advance(1)
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    await clock.advance(500)
+    await entered
+    await clock.settle()
+
+    expect(world.composer).toBe('LoginTests.testExpiredToken failed')
+    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved. What you typed is in the prompt box.")
+  })
+
   test("of two presses from one render, the response that lands first stands, and a toast says the other wasn't saved", async ($, on) => {
     const { world, clock } = seat(on)
     await start($)

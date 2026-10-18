@@ -152,6 +152,8 @@ export function wrapRows(text: string, columns: number): string[] {
           breakRow()
         }
 
+        // One that doesn't fit breaks the row, an empty one too: the engine
+        // draws one wider than any row under an empty row.
         if (used + cells > width) {
           breakRow()
         }

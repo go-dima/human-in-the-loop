@@ -92,26 +92,41 @@ export function cellsOf(text: string): number {
   return cells + width
 }
 
+/** Splits text into what the terminal draws as one: a character with its marks, joiners and modifiers. */
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+
 /**
  * The rows `text` takes in `columns` cells, wrapped as the terminal's `Text`
  * with `wrap="wrap"` wraps it: at spaces, the space kept at the end of the
- * row, and a word longer than a row broken where the row ends.
+ * row, and a word longer than a row broken where the row ends, between the
+ * characters it draws.
  */
 export function wrapRows(text: string, columns: number): string[] {
   const width = Math.max(1, Math.floor(columns))
   const rows = ['']
+  // The cells the last row takes.
+  let used = 0
+
+  const breakRow = () => {
+    rows.push('')
+    used = 0
+  }
+
+  const add = (piece: string, cells: number) => {
+    rows[rows.length - 1] += piece
+    used += cells
+  }
 
   text.split(' ').forEach((word, i) => {
     if (i > 0) {
-      if (cellsOf(rows.at(-1)!) >= width) {
-        rows.push('')
+      if (used >= width) {
+        breakRow()
       }
 
-      rows[rows.length - 1] += ' '
+      add(' ', 1)
     }
 
     const length = cellsOf(word)
-    const used = cellsOf(rows.at(-1)!)
 
     if (length > width) {
       // A word wider than a row starts on this one when that breaks it no more often.
@@ -119,25 +134,27 @@ export function wrapRows(text: string, columns: number): string[] {
       const breaksNext = Math.floor((length - 1) / width)
 
       if (breaksNext < breaksHere) {
-        rows.push('')
+        breakRow()
       }
 
-      for (const char of word) {
-        if (cellsOf(rows.at(-1)!) + cellsOf(char) > width) {
-          rows.push('')
+      for (const { segment } of GRAPHEMES.segment(word)) {
+        const cells = cellsOf(segment)
+
+        if (used + cells > width) {
+          breakRow()
         }
 
-        rows[rows.length - 1] += char
+        add(segment, cells)
       }
 
       return
     }
 
     if (used + length > width && used > 0 && length > 0) {
-      rows.push('')
+      breakRow()
     }
 
-    rows[rows.length - 1] += word
+    add(word, length)
   })
 
   return rows

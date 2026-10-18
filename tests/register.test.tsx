@@ -450,6 +450,14 @@ describe('long titles', () => {
     expect(rowsOf('Fix the ⏳ timeouts ✅ before the ⛔ freeze', 20)).toBe(3)
   })
 
+  test('break a word wider than the row between the characters the terminal draws, never inside one', () => {
+    // A skin tone stays on its hand, U+FE0F on its sun, emoji joined by U+200D together, and a conjunct with its vowel sign.
+    expect(wrapRows('👍🏽👍🏽👍🏽👍🏽👍🏽', 9)).toEqual(['👍🏽👍🏽👍🏽👍🏽', '👍🏽'])
+    expect(wrapRows('Status:☀️', 8)).toEqual(['Status:', '☀️'])
+    expect(wrapRows('Pair 👩‍💻👩‍💻👩‍💻👩‍💻', 7)).toEqual(['Pair 👩‍💻', '👩‍💻👩‍💻👩‍💻'])
+    expect(wrapRows('नमस्ते', 3)).toEqual(['नम', 'स्ते'])
+  })
+
   test('count East Asian wide forms two cells, and the ambiguous ones one', () => {
     expect(cellsOf('〈☰⚊䷀ꥠ︐﹐\u{16FE0}\u{17000}\u{1B000}\u{1D300}\u{1F200}')).toBe(24)
     expect(cellsOf('㉈')).toBe(1)

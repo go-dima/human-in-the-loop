@@ -51,6 +51,9 @@ SAVED = [
     {'id': 5, 'title': LONG, 'why': 'It leaked.', 'state': 'done', 'update': 'pending'},
 ]
 
+# Emoji the terminal draws two cells wide, below U+1F300 too: the title wraps at 100 columns.
+EMOJI = 'Tag issues ✅ done, ❌ failed, ⏳ waiting, ⚡ urgent, ⛔ blocked'
+
 # An answer longer than its field's row, with a word longer than the row too.
 DRAFT = 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding'
 
@@ -132,6 +135,14 @@ class Pane(unittest.TestCase):
                 for row in title_rows[1:]:
                     self.assertTrue(row.startswith('  ') and not row.startswith('   '), 'a title row out of line\n' + context)
                 self.assertIn('3m · from an earlier session', joined(title_rows), context)
+
+    def test_emoji_take_the_cells_the_terminal_draws_them_in(self):
+        for columns in (36, 100):
+            with self.subTest(columns=columns):
+                body, context = self.draw([{'id': 7, 'title': EMOJI, 'why': 'The ⌛ build waits on it.', 'kind': 'answer'}], columns)
+
+                self.assert_fits(body, context)
+                self.assertIn(f'#7 {EMOJI} 3m · from an earlier session', joined(body), context)
 
     def test_saved_responses_and_titles_past_80_characters_show_whole(self):
         for columns in (48, 64):

@@ -432,6 +432,25 @@ describe('long titles', () => {
     expect(rowsOf('ステージング環境のデータベース移行を承認してください', 30)).toBe(2)
   })
 
+  test('count an emoji as the terminal draws it: two cells, however it is built', () => {
+    // Drawn as emoji by default, below U+1F300 too.
+    expect(cellsOf('⌛ ✅ ⚡ ⭐ 🀄 🈯')).toBe(17)
+    // An emoji drawn as text unless U+FE0F asks otherwise.
+    expect(cellsOf('☀ 🌡')).toBe(3)
+    expect(cellsOf('☀️ 🌡️ ⚠️')).toBe(8)
+    // A keycap, a skin tone, a flag, and emoji joined by U+200D.
+    expect(cellsOf('1️⃣ 👍🏽 🇮🇱 👩‍💻 🫱🏼‍🫲🏿')).toBe(14)
+    // Marks and format characters take no cell of their own, nor a Hangul vowel and final spelled apart.
+    expect(cellsOf('é​')).toBe(1)
+    expect(cellsOf('각')).toBe(2)
+    expect(rowsOf('Fix the ⏳ timeouts ✅ before the ⛔ freeze', 20)).toBe(3)
+  })
+
+  test('count East Asian wide forms two cells, and the ambiguous ones one', () => {
+    expect(cellsOf('〈☰⚊䷀ꥠ︐﹐\u{16FE0}\u{17000}\u{1B000}\u{1D300}\u{1F200}')).toBe(24)
+    expect(cellsOf('㉈')).toBe(1)
+  })
+
   test('the pane asks for a row for each row a wrapped title takes, at the width it is drawn in', () => {
     const view = {
       shown: [INSTRUMENTS, XCODE_LONG],

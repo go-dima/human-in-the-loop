@@ -50,19 +50,46 @@ export function sizeOf(chars: number): string {
   return chars < 1024 ? `${chars} B` : `${(chars / 1024).toFixed(1)} KB`
 }
 
-/** Wide in a terminal: East Asian wide and fullwidth forms, and emoji. */
+/**
+ * Wide in a terminal: East Asian wide and fullwidth forms, and emoji drawn
+ * as emoji by default (`⌚`, `✅`, `🀄`; `☀` asks for it with U+FE0F). A
+ * flag's two letters take a cell each.
+ */
 const WIDE =
-  /[ᄀ-ᅟ⺀-〾ぁ-㏿㐀-䶿一-鿿ꀀ-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]|[\u{1F300}-\u{1FAFF}\u{20000}-\u{3FFFD}]/u
+  /[\u1100-\u115F\u2329\u232A\u2630-\u2637\u268A-\u268F\u2E80-\u303E\u3041-\u3247\u3250-\u9FFF\uA000-\uA4CF\uA960-\uA97F\uAC00-\uD7A3\uF900-\uFAFF\uFE10-\uFE19\uFE30-\uFE6B\uFF00-\uFF60\uFFE0-\uFFE6\u{16FE0}-\u{16FE3}\u{16FF0}-\u{16FF6}\u{17000}-\u{18DFF}\u{1AFF0}-\u{1B2FF}\u{1D300}-\u{1D376}\u{1F200}-\u{1F2FF}\u{20000}-\u{3FFFD}]|(?!\p{Regional_Indicator})\p{Emoji_Presentation}/u
 
-/** The terminal cells `text` takes: two for a wide character, none for a combining mark. */
+/** Drawn in no cell of its own: a mark or format character, a Hangul vowel or final joining its syllable. */
+const JOINING = /[\p{M}\p{Cf}\u1160-\u11FF\uD7B0-\uD7FF]/u
+
+/**
+ * The terminal cells `text` takes, as the engine counts them: two for a
+ * wide character, none for a mark on the one before, and two for an emoji
+ * however it is built (`☀️`, `1️⃣`, `👍🏽`, `👩‍💻`).
+ */
 export function cellsOf(text: string): number {
   let cells = 0
+  // The character the ones after it may join, and the cells they take together.
+  let base = ''
+  let width = 0
+  let previous = ''
 
   for (const char of text) {
-    cells += /\p{M}/u.test(char) ? 0 : WIDE.test(char) ? 2 : 1
+    if (char === '\uFE0F' && width === 1 && /\p{Emoji}/u.test(base)) {
+      width = 2
+    } else if (/\p{Emoji_Modifier}/u.test(char) && /\p{Emoji_Modifier_Base}/u.test(previous)) {
+      width = 2
+    } else if (previous === '\u200D' && width === 2 && /\p{Extended_Pictographic}/u.test(base) && /\p{Extended_Pictographic}/u.test(char)) {
+      // Joined by U+200D, emoji draw as one.
+    } else if (!JOINING.test(char)) {
+      cells += width
+      base = char
+      width = WIDE.test(char) ? 2 : 1
+    }
+
+    previous = char
   }
 
-  return cells
+  return cells + width
 }
 
 /**

@@ -1113,11 +1113,11 @@ describe('the answer field', () => {
     await $.tool.call(XCODE_TASK)
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer-1', text: 'sk_live_51HxAbCdEfGhIjKlMnOp', kind: 'change' })
-    await ui.input({ key: 'answer-1', text: 'sk_live_51HxAbCdEfGhIjKlMnOp' })
+    await ui.input({ key: 'answer-1', text: KEY_SHAPED, kind: 'change' })
+    await ui.input({ key: 'answer-1', text: KEY_SHAPED })
     await ui.press({ key: 'edit' })
 
-    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('sk_live_51HxAbCdEfGhIjKlMnOp')
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe(KEY_SHAPED)
   })
 
   test('typed in, the field keeps the value it opened with: one drawn anew puts its text back, keys typed since lost', async ($, on) => {
@@ -1995,9 +1995,8 @@ describe('responding', () => {
     await $.tool.call(XCODE_TASK)
     const ui = await $.ui.mount(PANE)
     const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
-    const key = `sk_live_${'0'.repeat(24)}`
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer-1', text: key })
+    await ui.input({ key: 'answer-1', text: KEY_SHAPED })
     await clock.settle()
     // Send anyway reads the task list late: Done on the phone lands meanwhile.
     world.slowRead = 'tasks'

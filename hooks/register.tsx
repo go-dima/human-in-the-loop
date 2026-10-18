@@ -88,6 +88,9 @@ const BATCH_MS = 800
 /** The longest a person, or Claude, waits on the store: what it doesn't answer by then finishes on its own. */
 const STORE_WAIT_MS = 5000
 
+/** What a tool answers while the session moves to another folder, before it has read that folder's tasks. */
+const MOVING = 'This session is still joining its project: the task store is slow to answer. Try again in a moment.'
+
 /** The pane the tasks wait in, and the command that opens it. */
 const PANE = 'my-tasks'
 const PANE_TITLE = 'My tasks'
@@ -233,8 +236,10 @@ const live = {
   endedMs: undefined as number | undefined,
   /** How many sessions of the process have ended: one that ends before its join comes up in the queue stays ended. */
   ends: 0,
-  /** Updates a prompt entered without, by `updateKeyOf`: given back once, each counts as heard the next time. */
-  reworded: new Set<string>(),
+  /** Responses a prompt entered without, by `updateKeyOf`: they go with Send now or the next prompt, not as a turn ends. */
+  held: new Set<string>(),
+  /** Joins into another folder not done yet: until then the tasks the process holds are the folder's it leaves. */
+  moving: 0,
   /** The store work asked for and not yet done: each piece waits for the one before. */
   queue: Promise.resolve() as Promise<unknown>,
   /** Store work a wait gave up on, not settled yet: while there is any, nothing waits on the store. */
@@ -338,11 +343,11 @@ export const register: Register = on => {
     }
 
     // Resumed into another folder, the session takes it on once the store
-    // work in flight is done. A task assigned before then is the old
-    // folder's: the join drops it here, and the old session's end write may
-    // leave it there. A process that never joined a folder has none to leave.
-    if (live.root !== '' && live.root !== (await $.session.root())) {
-      return { deny: 'This session is still joining its project: the task store is slow to answer. Assign the task again in a moment.' }
+    // work in flight is done and it has read it. A task assigned before then
+    // is the old folder's: the join drops it here, and the old session's end
+    // write may leave it there.
+    if (live.moving > 0) {
+      return { deny: MOVING }
     }
 
     // Task numbers count per project, across its sessions: the next is past
@@ -396,6 +401,10 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: LIST }, async ($, e) => {
+    if (live.moving > 0) {
+      return { deny: MOVING }
+    }
+
     await wake($)
     const args = e as unknown as Record<string, unknown>
     const id = typeof args['id'] === 'number' ? args['id'] : undefined
@@ -426,6 +435,10 @@ export const register: Register = on => {
   on('tool.call', { tool: WITHDRAW }, async ($, e) => {
     if (e.agentId !== undefined) {
       return { deny: 'Only the main agent withdraws tasks.' }
+    }
+
+    if (live.moving > 0) {
+      return { deny: MOVING }
     }
 
     await wake($)
@@ -487,8 +500,9 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       // Answers saved while Claude worked go now that it's free, unless a
       // task is still open: then they go with that last answer, together.
+      // One a prompt entered without waits for Send now or the next prompt.
       const all = await read($, tasks)
-      const isAllAnswered = all.some(task => task.update === 'pending') && !all.some(isActive)
+      const isAllAnswered = all.some(task => task.update === 'pending' && !live.held.has(updateKeyOf(task))) && !all.some(isActive)
 
       if (live.isSendingAtEnd || isAllAnswered) {
         live.isSendingAtEnd = false
@@ -518,7 +532,7 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (e.origin.kind === 'plugin' && e.origin.name === PLUGIN) {
+    if ((e.origin.kind === 'plugin' && e.origin.name === PLUGIN) || live.moving > 0) {
       return next(e)
     }
 
@@ -591,7 +605,7 @@ export const register: Register = on => {
     const result = await next(e)
     const shown = (await read($, tasks)).filter(isShown)
 
-    if (shown.length === 0) {
+    if (shown.length === 0 || live.moving > 0) {
       return result
     }
 
@@ -859,6 +873,7 @@ async function syncWorking($: EngineInterface) {
 async function join($: EngineInterface, ends = live.ends) {
   const sessionId = await $.session.id()
   const root = await $.session.root()
+  const isMoving = live.root !== '' && live.root !== root
 
   // A row of the conversation the process leaves is none of this one's.
   live.isUnread = false
@@ -905,18 +920,29 @@ async function join($: EngineInterface, ends = live.ends) {
     return load($)
   }).catch(() => undefined)
 
+  if (isMoving) {
+    live.moving += 1
+    void joined.then(() => {
+      live.moving -= 1
+    })
+  }
+
   // Tasks from an earlier session: the status line says so, and the pane
-  // opens where the terminal is wide enough to seat it unasked.
+  // opens where the terminal is wide enough to seat it unasked, unless the
+  // session has ended since.
   const shown = joined
     .then(async () => {
-      if (await refresh($)) {
+      if ((await refresh($)) && live.ends === ends) {
         await show($, false)
       }
     })
     .catch(() => undefined)
 
-  live.heartbeat?.cancel()
-  live.heartbeat = $.clock.every(HEARTBEAT_MS, () => void beat($))
+  // One that ended before this ran has no heartbeat: its end stopped the last.
+  if (live.ends === ends) {
+    live.heartbeat?.cancel()
+    live.heartbeat = $.clock.every(HEARTBEAT_MS, () => void beat($))
+  }
 
   // A store slow to answer holds up the start 5 seconds at most: what the
   // session takes on shows once it answers.
@@ -1424,24 +1450,15 @@ async function passOn<R extends PromptSubmitResult>(
     if (result.drop !== undefined) {
       back = { lost: due, note: onDrop, reason: result.drop }
     } else {
-      // A hook beneath that rewords an update's head (masks a secret in its
-      // title, say) leaves it out of every prompt: given back each time, it
-      // would go again as each turn its message starts ends. Given back
-      // once, it counts as heard the next time, and a toast says how.
       const lost = due.filter(task => !isCarried(result, task))
-      const again = lost.filter(task => !live.reworded.has(updateKeyOf(task)))
-      const twice = lost.filter(task => live.reworded.has(updateKeyOf(task)))
 
-      lost.forEach(task => live.reworded.add(updateKeyOf(task)))
-
-      if (again.length > 0) {
-        back = { lost: again, note: 'why', reason: 'a hook took it out of the prompt' }
-      }
-
-      if (twice.length > 0) {
-        $.ui.toast(`A hook changed your response to ${numbersOf(twice.map(task => task.id))} again: Claude has it as the hook left it.`, {
-          timeoutMs: 8000,
-        })
+      if (lost.length > 0) {
+        // The prompt entered, and Claude takes a turn on it: sent again as
+        // that turn ends, a response a hook beneath always takes out (or
+        // rewords at its head) would go round and round. It waits for Send
+        // now, as the toast says, or the next prompt.
+        lost.forEach(task => live.held.add(updateKeyOf(task)))
+        back = { lost, note: 'why', reason: 'a hook took it out of the prompt' }
       }
     }
 
@@ -1607,6 +1624,11 @@ function sendSoon($: EngineInterface) {
  * engine's last word on it was.
  */
 async function send($: EngineInterface, isTurnOver = false) {
+  // What the process holds is the folder's it leaves: its Claude hears it there.
+  if (live.moving > 0) {
+    return
+  }
+
   await wake($)
   const due = await claim($)
 

@@ -747,7 +747,7 @@ describe('responding', () => {
     expect(again.context?.[0]).not.toContain('LoginTests.testExpiredToken failed')
   })
 
-  test('a response whose head a hook beneath rewords goes back once, and counts as heard the next time: the turns it starts end', async ($, on) => {
+  test('a response a hook beneath takes out of the message that wakes Claude waits for Send now: the turn that message starts ends without sending it again', async ($, on) => {
     const { world, clock } = seat(on)
     await start($)
 
@@ -762,15 +762,21 @@ describe('responding', () => {
     expect(world.submitted).toHaveLength(1)
     expect(world.toasts.at(-1)).toBe("Claude didn't get your response to #1: a hook took it out of the prompt. It's saved; press Send now in /my-tasks.")
 
-    // The turn that message starts ends, and it goes once more: then Claude has had it twice.
-    for (const turnId of ['t1', 't2', 't3']) {
+    // The turn that message starts ends, and another after it.
+    for (const turnId of ['t1', 't2']) {
       await $.turn.start({ text: '', turnId })
       await $.turn.complete({ ...DONE, turnId })
       await clock.settle()
     }
 
+    expect(world.submitted).toHaveLength(1)
+    expect(world.status).toBe('✓ 1 not sent yet · /my-tasks')
+
+    world.masking = undefined
+    await ui.press({ key: 'send-1' })
+    await clock.settle()
+
     expect(world.submitted).toHaveLength(2)
-    expect(world.toasts.at(-1)).toBe('A hook changed your response to #1 again: Claude has it as the hook left it.')
     expect(world.status).toBeUndefined()
   })
 
@@ -1872,23 +1878,23 @@ describe('across sessions', () => {
     await clock.settle()
   }
 
-  test('a response given back once counts as heard the next time, and only that response: another task by its number goes back too', async ($, on) => {
+  test("a response held for Send now holds back no other task's by its number", async ($, on) => {
     const done = { ...ROTATE, state: 'done', update: 'pending', answer: 'Rotated.' } as const
     const { world, clock } = seat(on, {
       [KEYS.session('session-0')]: { tasks: [{ ...done, updatedMs: 5 }], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 8 },
     })
     await start($)
 
-    // A hook beneath masks the vault's name in every prompt.
+    // A hook beneath takes the vault's name out of a typed prompt's digest: #7 waits for Send now.
     world.masking = text => text.replaceAll('Vault', '*****')
-    const givenBack = () => world.toasts.filter(toast => toast.startsWith("Claude didn't get your response to #7"))
     await $.prompt.submit(typed('next'))
-    await $.prompt.submit(typed('and the next'))
+    world.masking = undefined
+    await (await $.ui.mount(PANE)).press({ key: 'send-7' })
+    await clock.settle()
 
-    expect(givenBack()).toHaveLength(1)
-    expect(world.status).toBeUndefined()
+    expect(world.submitted).toHaveLength(1)
 
-    // Another session's #7, answered there before it ended, comes to the session after /clear.
+    // Another session's #7, answered there before it ended, comes to the session after /clear, and goes as a turn ends.
     world.store[KEYS.session('session-9')] = {
       tasks: [{ ...done, sessionId: 'session-9', updatedMs: 9 }],
       seenMs: NOW - 60_000,
@@ -1899,9 +1905,12 @@ describe('across sessions', () => {
     await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
     await clock.advance(1)
     await clock.settle()
-    await $.prompt.submit(typed('one more'))
+    await $.turn.start({ text: 'next', turnId: 't1' })
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
 
-    expect(givenBack()).toHaveLength(2)
+    expect(world.submitted).toHaveLength(2)
+    expect(world.submitted[1]).toContain('#7 Rotate the leaked token in Vault')
   })
 
   test('a session that ends after /clear before its join has begun ends all the same and takes nothing quiet', async ($, on) => {
@@ -1919,13 +1928,23 @@ describe('across sessions', () => {
 
     expect(slotsIn(world.store)['session-2']?.tasks.map(task => task.id)).toEqual([1])
     expect(slotsIn(world.store)['session-2']?.endedMs).toBe(NOW)
+    // No heartbeat, and no pane opened unasked, for a session that has ended.
+    expect(world.opens).toHaveLength(1)
+    world.ops = []
+    await clock.advance(60_000)
+    await clock.settle()
+    expect(world.ops).toEqual([])
   })
 
-  test("Claude can't assign a task while a session resumed into another folder waits to join it", async ($, on) => {
+  test("a session resumed into another folder acts on none of the tasks it leaves, and assigns none, until it has read the new folder", async ($, on) => {
     const { world, clock } = seat(on)
     await start($)
 
+    // A response saved while Claude works, not sent yet.
     await $.tool.call(KEY_TASK)
+    await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
+    await (await $.ui.mount(PANE)).press({ key: 'done' })
+    await clock.advance(1000)
     // The heartbeat's read never comes back, and holds up the store work behind it.
     world.isStuck = true
     await clock.advance(60_000)
@@ -1935,16 +1954,30 @@ describe('across sessions', () => {
     await clock.advance(10_000)
     await resumed
     await clock.settle()
-    const refused = await $.tool.call(XCODE_TASK)
 
-    expect((refused as { deny?: string }).deny).toContain('still joining its project')
+    const isRefused = async () => String(((await $.tool.call(XCODE_TASK)) as { deny?: string }).deny).includes('still joining its project')
+    expect(await isRefused()).toBe(true)
+    expect(((await $.tool.call({ tool: LIST })) as { deny?: string }).deny).toContain('still joining its project')
+    expect((await $.prompt.context({ blocks: [] })).blocks).toHaveLength(0)
+    expect((await $.prompt.submit(typed('hello'))).context).toBeUndefined()
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+    expect(world.submitted).toHaveLength(0)
+
+    // The store answers, and the new folder's first read is slow: still nothing until it is in.
+    world.isStuck = true
+    world.unstick?.()
+    await clock.settle()
+    expect(await isRefused()).toBe(true)
 
     world.unstick?.()
     await clock.settle()
     const assigned = await $.tool.call(XCODE_TASK)
 
     expect(String((assigned as { result?: unknown }).result)).toContain('Assigned task #1')
-    expect(Object.values(projectOf('/other', world.store).slots).map(slot => slot.tasks.map(task => task.title))).toEqual([[XCODE_TASK.title]])
+    expect(world.submitted).toHaveLength(0)
+    // The response waits in the folder it was given in, for the next session there.
+    expect(slotsIn(world.store)['session-1']?.tasks.map(task => task.update)).toEqual(['pending'])
   })
 
   test('a session that ends after /clear before it has joined, the store stuck, ends all the same and takes nothing quiet', async ($, on) => {
@@ -2675,6 +2708,25 @@ describe('across sessions', () => {
     expect(world.store['tasks:/repo']).toEqual({ nextId: 3, sessions: {}, taken: {} })
   })
 
+
+  test('a 0.1.4 note whose task the session let go of in a write that failed leaves only once the slot is written without it', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    await $.tool.call(XCODE_TASK)
+    // A 0.1.4 session took #2 on while this one slept; the heartbeat lets it go, and can't write.
+    world.store['tasks:/repo'] = { nextId: 3, sessions: {}, taken: { 'session-1': { ids: [2], atMs: NOW } } }
+    world.isWriteFailing = true
+    await clock.advance(60_000)
+    await clock.settle()
+    world.isWriteFailing = false
+    const again = await $.tool.call(KEY_TASK)
+
+    expect(String((again as { result?: unknown }).result)).toContain('Task #1 already asks the user for this')
+    expect(slotsIn(world.store)['session-1']?.tasks.map(task => task.id)).toEqual([1])
+    expect(world.store['tasks:/repo']).toEqual({ nextId: 3, sessions: {}, taken: {} })
+  })
 
   test('a 0.1.4 note of tasks taken from this session, put back after it was read, takes nothing this session took on', async ($, on) => {
     // A 0.1.4 session took this one's #3 on while it slept, and an ended session left a #3 of its own.

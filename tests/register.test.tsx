@@ -533,6 +533,37 @@ describe('the pane and /my-tasks', () => {
     expect(world.opens.at(-1)?.focus).toBe(true)
   })
 
+  test('the phone, which draws no field, offers Done and a Reject that rejects at once', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
+
+    expect((await phone.findAll({ type: 'Button' })).map(button => button.props.label)).toEqual(['Done', 'Reject', 'Hide'])
+
+    await phone.press({ key: 'reject' })
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(world.submitted).toEqual([
+      "My response to a task you gave me (Human in the loop):\n\n#1 Run xcodebuild test on your Mac, paste the failures: I won't do this.",
+    ])
+  })
+
+  test('a field open on a surface that draws one leaves the task its buttons on the phone', async ($, on) => {
+    seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
+
+    expect(await ui.find({ type: 'Input' })).toBeDefined()
+    expect((await phone.findAll({ type: 'Button' })).map(button => button.props.label)).toEqual(['Done', 'Reject', 'Hide'])
+  })
+
   test('Hide closes the pane and the status line keeps the count', async ($, on) => {
     const { world } = seat(on)
     await start($)

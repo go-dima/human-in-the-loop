@@ -638,8 +638,10 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements
-    // The mobile app draws no field yet: answers and reasons wait for a surface that does.
-    const Input = 'Input' in elements ? elements.Input : undefined
+    // The mobile app draws no field yet: answers and reasons wait for a surface
+    // that does. The engine fills an element a surface lacks with one that draws
+    // nothing, so the surface says, not the table.
+    const Input = e.surface !== 'mobile' && 'Input' in elements ? elements.Input : undefined
     const view = await paneView($, { canType: Input !== undefined, isFocused: e.props.isFocused })
 
     // The pane asks for the rows its tree takes at the width it is drawn in:
@@ -780,7 +782,8 @@ export const register: Register = on => {
     }
 
     const selectedRows = (task: Task) => {
-      const isEditing = field !== null && field.id === task.id
+      // A field open on a surface that draws one: elsewhere the task keeps its buttons.
+      const isEditing = view.canType && field !== null && field.id === task.id
       const control = !isEditing
         ? actionsOf(task)
         : field.field === 'answer'

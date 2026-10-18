@@ -1829,6 +1829,62 @@ describe('across sessions', () => {
     expect(await ending).toEqual({ sessionId: 'session-1' })
   })
 
+  /** Ends session 1 with /clear while the store is stuck: session 2 waits to join until it answers. */
+  async function clearStuck($: Engine, { world, clock }: ReturnType<typeof seat>) {
+    // The heartbeat's read never comes back, and holds up the store work behind it.
+    world.isStuck = true
+    await clock.advance(60_000)
+    world.sessionId = 'session-2'
+    const cleared = $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    await clock.advance(10_000)
+    await cleared
+    await clock.settle()
+  }
+
+  test('a session that ends after /clear before it has joined, the store stuck, ends all the same and takes nothing quiet', async ($, on) => {
+    const seated = seat(on)
+    const { world, clock } = seated
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    await clearStuck($, seated)
+    const ending = $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-2', resume: { id: 'session-2' } })
+    await clock.advance(10_000)
+    await ending
+
+    // A session gone quiet meanwhile keeps its task: the next live session takes it on.
+    world.store[KEYS.session('session-q')] = { tasks: [{ ...ROTATE, sessionId: 'session-q' }], seenMs: NOW - 10 * 60_000, nextId: 8 }
+    world.unstick?.()
+    await clock.settle()
+
+    expect(slotsIn(world.store)['session-2']?.tasks.map(task => task.id)).toEqual([1])
+    expect(slotsIn(world.store)['session-2']?.endedMs).toBe(NOW + 70_000)
+  })
+
+  test("a task assigned after /clear before the session has joined, the store stuck, is the new session's", async ($, on) => {
+    const seated = seat(on)
+    const { world, clock } = seated
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    await clearStuck($, seated)
+    await $.tool.call(XCODE_TASK)
+
+    const ui = await $.ui.mount(PANE)
+    const context = async () => (await $.prompt.context({ blocks: [] })).blocks.at(-1)?.text
+    expect(await textOf(ui, 'task-1')).toContain('from an earlier session')
+    expect(await textOf(ui, 'task-2')).not.toContain('from an earlier session')
+    expect(await context()).toContain('#2 open: Run xcodebuild')
+
+    world.unstick?.()
+    await clock.settle()
+
+    expect(slotsIn(world.store)['session-2']?.tasks.map(task => task.sessionId)).toEqual(['session-1', 'session-2'])
+    expect(await textOf(ui, 'task-2')).not.toContain('from an earlier session')
+    expect(await context()).toContain('#1 open (from an earlier session)')
+    expect(await context()).toContain('#2 open: Run xcodebuild')
+  })
+
   test('a store that stops answering holds up a tool call a few seconds, and nothing after it', async ($, on) => {
     // A 0.1.4 session alive here: assigning raises 0.1.4's count too.
     const { world, clock } = seat(on, { 'tasks:/repo': { nextId: 1, sessions: { 'session-0': { tasks: [ROTATE], seenMs: NOW } }, taken: {} } })

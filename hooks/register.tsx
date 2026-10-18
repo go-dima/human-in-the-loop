@@ -231,6 +231,8 @@ const live = {
   readMs: 0,
   /** Set once the session ended: its slot says so from then on. */
   endedMs: undefined as number | undefined,
+  /** How many sessions of the process have ended: one that ends before its join comes up in the queue stays ended. */
+  ends: 0,
   /** The store work asked for and not yet done: each piece waits for the one before. */
   queue: Promise.resolve() as Promise<unknown>,
   /** Store work a wait gave up on, not settled yet: while there is any, nothing waits on the store. */
@@ -278,6 +280,7 @@ export const register: Register = on => {
     live.heartbeat?.cancel()
     live.heartbeat = null
     live.endedMs = await $.clock.now()
+    live.ends += 1
 
     // The slot marked ended, in one write and no read, once the store work in
     // flight is done; a session that never read the project reads it first.
@@ -357,7 +360,9 @@ export const register: Register = on => {
       ...ask,
       state: 'open',
       update: 'none',
-      sessionId: live.sessionId,
+      // The conversation's own: until it joins the project (a store slow
+      // after /clear), the process still acts for the one it left.
+      sessionId: await $.session.id(),
       createdMs: nowMs,
       updatedMs: nowMs,
     }
@@ -577,7 +582,7 @@ export const register: Register = on => {
       return result
     }
 
-    return { ...result, blocks: [...result.blocks, { name: 'humanInTheLoop', text: contextOf(shown, live.sessionId) }] }
+    return { ...result, blocks: [...result.blocks, { name: 'humanInTheLoop', text: contextOf(shown, await $.session.id()) }] }
   })
 
   on('ui.render', { component: 'ToolUse', props: { tool: ASSIGN } }, ($, e, next) => {
@@ -839,6 +844,7 @@ async function syncWorking($: EngineInterface) {
  * earlier session, the pane.
  */
 async function join($: EngineInterface) {
+  const ends = live.ends
   const sessionId = await $.session.id()
   const root = await $.session.root()
 
@@ -876,7 +882,13 @@ async function join($: EngineInterface) {
     live.hasSlot = false
     live.writtenMs = 0
     live.readMs = 0
-    live.endedMs = undefined
+
+    // A session that ended while this waited in the queue (an exit right
+    // after /clear, the store slow) reads the project as an ending session
+    // does, and its end write, queued after this, marks its slot ended.
+    if (live.ends === ends) {
+      live.endedMs = undefined
+    }
 
     return load($)
   }).catch(() => undefined)
@@ -1354,7 +1366,7 @@ async function paneView($: EngineInterface, surface: Pick<PaneView, 'canType' | 
     editing: field,
     draft: field === null ? '' : (live.drafts.get(field.id) ?? ''),
     nowMs: await $.clock.now(),
-    sessionId: live.sessionId,
+    sessionId: await $.session.id(),
     isWorking: await read($, isWorking),
     canType: surface.canType,
     isFocused: surface.isFocused,

@@ -4,7 +4,8 @@ Run with `python3 tests/live/test_pane.py` from the repository's root, with
 `claude` and `tmux` on the PATH. Each case seeds tasks an ended session left,
 opens /my-tasks in a terminal of the given size and reads the screen back:
 every title shows whole, nothing is cut off at the pane's bottom, and the
-pane asks for no rows it leaves empty.
+pane asks for no rows it leaves empty. With RENDERS_DIR set, each screen a
+test reads is kept there, and `tests/live/renders.py` lays them out.
 """
 
 import os
@@ -66,7 +67,8 @@ class Pane(unittest.TestCase):
         claude = Claude(ROOT)
         try:
             claude.seed(tasks)
-            screen = claude.pane(columns, HEIGHT, keys)
+            name = '-'.join([self._testMethodName, str(columns), *keys])
+            screen = claude.pane(columns, HEIGHT, keys, name=name)
         finally:
             claude.close()
         body = pane_body(screen)
@@ -155,7 +157,8 @@ class TranscriptRow(unittest.TestCase):
             with self.subTest(columns=columns):
                 claude = Claude(ROOT)
                 try:
-                    screen = claude.transcript(columns, 40, {'title': XCODE, 'why': "I can't run Xcode here.", 'kind': 'answer'})
+                    tool_input = {'title': XCODE, 'why': "I can't run Xcode here.", 'kind': 'answer'}
+                    screen = claude.transcript(columns, 40, tool_input, name=f'{self._testMethodName}-{columns}')
                 finally:
                     claude.close()
                 lines = screen.split('\n')

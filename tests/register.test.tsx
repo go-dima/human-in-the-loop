@@ -2010,6 +2010,74 @@ describe('across sessions', () => {
     expect(slotsIn(world.store)['session-1']?.tasks.map(task => task.update)).toEqual(['pending'])
   })
 
+  test('a session resumed into another folder and straight back acts on none of that folder\'s tasks as it moves back', async ($, on) => {
+    const { world, clock } = seat(on, {
+      [keysOf('/other').session('session-0')]: { tasks: [ROTATE], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 8 },
+    })
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    // The heartbeat's read never comes back, and holds up the store work behind it.
+    world.isStuck = true
+    await clock.advance(60_000)
+    world.sessionId = 'session-3'
+    world.root = '/other'
+    const resumed = $.session.end({ reason: 'resume', sessionId: 'session-1', resume: { id: 'session-3' } })
+    await clock.advance(10_000)
+    await resumed
+    world.sessionId = 'session-4'
+    world.root = '/repo'
+    const back = $.session.end({ reason: 'resume', sessionId: 'session-3', resume: { id: 'session-4' } })
+    await clock.advance(10_000)
+    await back
+
+    // The store answers, its writes slow: Claude lists its tasks as the queue drains.
+    world.setMs = 1000
+    world.unstick?.()
+    const listed: string[] = []
+
+    for (let i = 0; i < 100; i++) {
+      await clock.advance(100)
+      const result = (await $.tool.call({ tool: LIST, show: 'all' })) as { result?: unknown; deny?: string }
+      listed.push(String(result.result ?? result.deny))
+    }
+
+    expect(listed.some(one => one.includes(ROTATE.title))).toBe(false)
+    expect(listed.at(-1)).toContain(KEY_TASK.title)
+  })
+
+  test("a response held for Send now holds back nothing of the folder the session resumes into", async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    world.masking = text => text.replaceAll('STRIPE_SECRET_KEY', '*****')
+    await (await $.ui.mount(PANE)).press({ key: 'done' })
+    await clock.advance(1000)
+    await clock.settle()
+    world.masking = undefined
+    // An answer the session that ended in the other folder never sent, with
+    // the number and the time of the response held here.
+    const updatedMs = slotsIn(world.store)['session-1']?.tasks[0]?.updatedMs
+    world.store[keysOf('/other').session('session-0')] = {
+      tasks: [{ ...ROTATE, id: 1, state: 'done', update: 'pending', updatedMs }],
+      seenMs: NOW - 60_000,
+      endedMs: NOW - 60_000,
+      nextId: 2,
+    }
+    world.sessionId = 'session-3'
+    world.root = '/other'
+    await $.session.end({ reason: 'resume', sessionId: 'session-1', resume: { id: 'session-3' } })
+    await clock.advance(1)
+    await clock.settle()
+    await $.turn.start({ text: '', turnId: 't1' })
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    expect(world.submitted).toHaveLength(2)
+    expect(world.submitted[1]).toContain(ROTATE.title)
+  })
+
   test('a session that ends after /clear before it has joined, the store stuck, ends all the same and takes nothing quiet', async ($, on) => {
     const seated = seat(on)
     const { world, clock } = seated

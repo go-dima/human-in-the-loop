@@ -211,6 +211,8 @@ type Synced = 'same' | 'lost' | 'joined'
 const live = {
   sessionId: '',
   root: '',
+  /** The folder the latest join is for, set as it is asked: `root` follows in queue order. */
+  joinRoot: '',
   /** A Send now row joined the running turn and no step has read it yet. */
   isUnread: false,
   /** A Send now the running turn could not take: it goes once the turn ends. */
@@ -874,7 +876,9 @@ async function syncWorking($: EngineInterface) {
 async function join($: EngineInterface, ends = live.ends) {
   const sessionId = await $.session.id()
   const root = await $.session.root()
-  const isMoving = live.root !== '' && live.root !== root
+  // From the folder the latest join is for: one still queued takes the process there first.
+  const isMoving = live.joinRoot !== '' && live.joinRoot !== root
+  live.joinRoot = root
 
   // A row of the conversation the process leaves is none of this one's.
   live.isUnread = false
@@ -897,6 +901,7 @@ async function join($: EngineInterface, ends = live.ends) {
       await update($, editing, () => null)
       await update($, loadedFor, () => null)
       live.drafts.clear()
+      live.held.clear()
       live.batch?.cancel()
       live.batch = null
       live.isSendingAtEnd = false

@@ -106,6 +106,10 @@ type Seat = Pick<PaneView, 'canType' | 'isFocused'> & { columns: number; isInlin
 /** An 80-column terminal's main screen: the pane's seat until a surface draws it. */
 const FIRST_SEAT: Seat = { columns: 76, canType: true, isFocused: false, isInline: true }
 
+function isSameSeat(one: Seat, other: Seat): boolean {
+  return one.columns === other.columns && one.canType === other.canType && one.isFocused === other.isFocused && one.isInline === other.isInline
+}
+
 const TOOLS: readonly ToolSpec[] = [
   {
     name: 'assign_task',
@@ -232,7 +236,8 @@ const live = {
   /**
    * Each field's draft as it opened, by `fieldKeyOf`: what it is drawn with.
    * It stays put while the field is typed in, as a value drawn anew puts the
-   * field's text back to it, keys typed meanwhile lost.
+   * field's text back to it, keys typed meanwhile lost; `reopenFields` brings
+   * it up to the draft where a field is drawn afresh.
    */
   opened: new Map<string, string>(),
   batch: null as Timer | null,
@@ -270,8 +275,13 @@ const live = {
   turns: new Set<string>(),
   /** Whether a turn runs, in the engine's own word (the band's `isWorking`), once it has said. */
   engineWorking: undefined as boolean | undefined,
-  /** Each surface drawing the pane, by `e.surface`, as it last drew it. */
-  seats: new Map<RenderSurface, Seat>(),
+  /**
+   * Each surface drawing the pane, by `e.surface`, as it last drew it: as
+   * each of its clients did, as near as a render tells, which names no client.
+   */
+  seats: new Map<RenderSurface, Seat[]>(),
+  /** The remote clients attached, by surface: two phones are two clients on one. */
+  clients: new Map<RenderSurface, Set<string>>(),
   /** The key of the element the pane's focus ring last moved onto. */
   ring: undefined as string | undefined,
   /** The rows the pane last asked for. */
@@ -658,9 +668,19 @@ export const register: Register = on => {
     )
   })
 
+  // A second client on a surface draws the pane at a width of its own, and
+  // its fields afresh.
+  on('session.attach', async ($, e, next) => {
+    const attached = await next(e)
+    live.clients.set(e.surface, new Set(live.clients.get(e.surface)).add(e.clientId))
+    reopenFields()
+    return attached
+  })
+
   // The last of a kind of surface gone, the pane fits the ones left.
   on('session.detach', async ($, e, next) => {
     const left = await next(e)
+    live.clients.get(e.surface)?.delete(e.clientId)
     const surfaces = await $.session.surfaces()
 
     for (const surface of live.seats.keys()) {
@@ -671,6 +691,14 @@ export const register: Register = on => {
 
     void refit($)
     return left
+  })
+
+  // Its pane closed, the surface forgets what the fields held: drawn again,
+  // each opens with what was typed in it. Hide does the same in `hide`.
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    const closed = await next(e)
+    reopenFields()
+    return closed
   })
 
   // The ring on the open field lets the terminal wrap what is typed there:
@@ -700,7 +728,10 @@ export const register: Register = on => {
     // off the rest.
     const columns = e.props.bodyColumns
     const seat: Seat = { columns, canType: view.canType, isFocused: view.isFocused, isInline: e.props.placement === 'inline' }
-    live.seats.set(e.surface, seat)
+    // A surface with two clients keeps the latest seats that differ, one for
+    // each, or each client's drawing would resize the pane against the other.
+    const others = (live.seats.get(e.surface) ?? []).filter(other => !isSameSeat(other, seat))
+    live.seats.set(e.surface, [...others, seat].slice(-Math.max(1, live.clients.get(e.surface)?.size ?? 0)))
 
     const { shown, editing: field, isWorking: working } = view
 
@@ -920,7 +951,7 @@ export const register: Register = on => {
             {hintOf(view)}
           </Text>
           <Box flexShrink={0}>
-            <Button key="hide" plain dimColor role="dismiss" label={HIDE} onPress={() => $.ui.close({ id: PANE })} />
+            <Button key="hide" plain dimColor role="dismiss" label={HIDE} onPress={() => hide($)} />
           </Box>
         </Box>
       </Box>
@@ -1459,7 +1490,11 @@ async function refresh($: EngineInterface): Promise<boolean> {
  * surface seated it: one opened unasked waits on a narrow terminal.
  */
 async function show($: EngineInterface, isAsked: boolean): Promise<boolean> {
-  const rows = await rowsWanted($)
+  return openAt($, await rowsWanted($), isAsked)
+}
+
+/** Opens the My tasks pane `rows` tall, or re-sizes it; resolves whether the surface seated it. */
+async function openAt($: EngineInterface, rows: number, isAsked: boolean): Promise<boolean> {
   live.rows = rows
   // The pane is a view of the tasks: one that can't open costs the user a
   // click on /my-tasks, never the task itself.
@@ -1491,10 +1526,13 @@ async function paneView($: EngineInterface, surface: Pick<PaneView, 'canType' | 
 
 /** Re-sizes the pane to what it holds now, when it is on screen. */
 async function fit($: EngineInterface) {
+  const rows = await rowsWanted($)
+  // Asked once the rows are known, as the pane re-sizes: one that closed
+  // meanwhile, its last task gone, stays closed.
   const panes = await $.ui.panes().catch(() => [])
 
   if (panes.some(pane => pane.id === PANE && pane.isPlaced)) {
-    await show($, false)
+    await openAt($, rows, false)
   }
 }
 
@@ -1504,7 +1542,7 @@ async function fit($: EngineInterface) {
  * surface leaving.
  */
 async function refit($: EngineInterface) {
-  if ([...live.seats.values()].some(seat => seat.isInline) && (await rowsWanted($)) !== live.rows) {
+  if ([...live.seats.values()].flat().some(seat => seat.isInline) && (await rowsWanted($)) !== live.rows) {
     await fit($)
   }
 }
@@ -1515,7 +1553,7 @@ async function refit($: EngineInterface) {
  * would resize it against the others.
  */
 async function rowsWanted($: EngineInterface): Promise<number> {
-  const inline = [...live.seats.values()].filter(seat => seat.isInline)
+  const inline = [...live.seats.values()].flat().filter(seat => seat.isInline)
   const rows = await Promise.all(
     (inline.length > 0 ? inline : [FIRST_SEAT]).map(async seat => rowsFor(await paneView($, seat), seat.columns, MAX_PANE_ROWS)),
   )
@@ -1725,6 +1763,22 @@ async function startEditing($: EngineInterface, id: number, field: Editing['fiel
 
   // A field the pane can't focus (it doesn't hold the keyboard) is still a click away.
   void $.ui.focus({ requestId: PANE, key }).then(undefined, () => undefined)
+}
+
+/**
+ * Hide: closes the pane. A press raises none of the plugin's own hooks, so
+ * it does here what its `ui.close` hook does for the person's close.
+ */
+async function hide($: EngineInterface) {
+  await $.ui.close({ id: PANE })
+  reopenFields()
+}
+
+/** Has each field drawn afresh open with what is typed in it so far. */
+function reopenFields() {
+  for (const [key, draft] of live.drafts) {
+    live.opened.set(key, draft)
+  }
 }
 
 async function stopEditing($: EngineInterface) {

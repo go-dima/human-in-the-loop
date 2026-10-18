@@ -194,6 +194,8 @@ class Claude:
         for key in keys:
             run('tmux', 'send-keys', '-t', self.session, key)
             time.sleep(0.5)
+        # Keys that close the pane and open it again leave it to come back.
+        wait_for(self.session, lambda s: '╰' in s)
         time.sleep(1.0)
         screen = capture(self.session)
         if name is not None:

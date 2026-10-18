@@ -200,6 +200,7 @@ function seat(on: On, store: Record<string, unknown> = {}) {
 
   on('session.id', () => ({ value: world.sessionId }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('session.attach', ($, e) => ({ clientId: e.clientId }))
   on('session.detach', ($, e) => ({ clientId: e.clientId }))
   on('session.surfaces', () => ({ value: world.surfaces }))
   on('session.root', () => ({ value: world.root }))
@@ -534,6 +535,32 @@ describe('long titles', () => {
     expect(world.opens.at(-1)?.rows).toBe(12)
   })
 
+  test('drawn by two clients of one surface, the pane asks for the rows the narrower takes, and keeps them', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    world.surfaces = ['terminal', 'mobile']
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    // A render names its surface, not its client: the tablet's and the phone's come as one surface's.
+    await runTasks($)
+    const mobile = await $.ui.mount({ ...inline(60), surface: 'mobile' })
+    await mobile.redraw(inline(32).props)
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // Each draws again: the pane asks for nothing new.
+    const opens = world.opens.length
+    await mobile.redraw(inline(60).props)
+    await mobile.redraw(inline(32).props)
+    expect(world.opens.length).toBe(opens)
+
+    // The phone leaves: the tablet drawing again, the pane fits it.
+    await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await mobile.redraw(inline(60).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
   test('docked beside the transcript, the terminal asks for no rows of its own', async ($, on) => {
     const { world } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
     world.surfaces = ['terminal', 'mobile']
@@ -562,6 +589,27 @@ describe('long titles', () => {
     await withdrawn
 
     expect(world.opens.length).toBe(opens)
+    expect(world.isPaneOpen).toBe(false)
+  })
+
+  test('re-sizing as its last task leaves, the pane stays closed', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(64))
+    await ui.press({ key: 'answer' })
+    // The answer wraps and the pane re-sizes, reading the tasks late: Claude withdraws the task meanwhile.
+    world.slowRead = 'tasks'
+    world.fastReads = 1
+    world.readMs = 500
+    const typing = ui.input({ key: 'answer-1', text: 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding', kind: 'change' })
+    await clock.advance(1)
+    await $.tool.call({ tool: WITHDRAW, id: 1, reason: 'Found them in the CI logs' })
+    await clock.advance(500)
+    await typing
+    await clock.settle()
+
     expect(world.isPaneOpen).toBe(false)
   })
 
@@ -760,6 +808,39 @@ describe('the answer field', () => {
     await $.tool.call(ANDROID_TASK)
 
     expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('')
+  })
+
+  test('hidden and opened again, the field holds what was typed in it', async ($, on) => {
+    const { clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Use the staging creds', kind: 'change' })
+    await clock.settle()
+    await ui.press({ key: 'hide' })
+    await ui.unmount()
+    await runTasks($)
+    const again = await $.ui.mount(PANE)
+
+    expect((await again.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('Use the staging creds')
+  })
+
+  test('a client attaching draws the field with what is typed in it', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Use the staging creds', kind: 'change' })
+    await clock.settle()
+    world.surfaces = ['terminal', 'desktop']
+    await $.session.attach({ surface: 'desktop', clientId: 'laptop' })
+    const laptop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+    expect((await laptop.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('Use the staging creds')
   })
 
   test('typed in, the field asks for the rows its text wraps to, and for one row less once the keys leave it', async ($, on) => {

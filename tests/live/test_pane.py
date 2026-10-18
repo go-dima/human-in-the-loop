@@ -183,6 +183,13 @@ class Pane(unittest.TestCase):
                 self.assertIn(DRAFT.replace(' ', ''), joined(body).replace('⏎ send', '').replace(' ', ''), context)
                 self.assertIn('Cancel', joined(body), context)
 
+    def test_closed_and_opened_again_the_field_holds_what_was_typed_in_it(self):
+        # ctrl+x x closes the pane as the person's close key does, and the
+        # terminal forgets the field's text; /my-tasks opens it again.
+        body, context = self.draw(TASKS[1:2], 64, keys=('r', DRAFT, 'C-x', 'x', '/my-tasks', 'Enter'))
+
+        self.assertIn(DRAFT.replace(' ', ''), joined(body).replace('⏎ send', '').replace(' ', ''), context)
+
     def test_a_long_answer_out_of_the_keys_keeps_the_pane_fitted(self):
         # Tab moves the keys on: the field draws one row of its text, the label squeezed onto a second.
         for columns in (36, 64):

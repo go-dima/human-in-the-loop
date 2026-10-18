@@ -137,7 +137,7 @@ The tasks never touch the band above the prompt, which What's Agent Doing and An
 
 ### The My tasks pane
 
-A pane (`$.ui.open({ id: 'tasks', rows })`, drawn by `ui.render` on `Pane`). In Claude Code's fullscreen layout from 110 columns it docks beside the transcript as a sidebar. On the main screen it sits inline above the prompt, sized to what it holds as it wraps there. The rows are one number for every surface, so drawn inline on two at once (the terminal and a phone), it asks for the most either takes.
+A pane (`$.ui.open({ id: 'tasks', rows })`, drawn by `ui.render` on `Pane`). In Claude Code's fullscreen layout from 110 columns it docks beside the transcript as a sidebar. On the main screen it sits inline above the prompt, sized to what it holds as it wraps there. The rows are one number for every surface, so drawn inline on two at once (the terminal and a phone), it asks for the most either takes. A render doesn't say which of two phones drew it, so there it keeps asking for the most either has needed until one comes or goes.
 
 - **It opens by itself** when Claude assigns a task, and at a session's start when tasks from an earlier one are waiting. Opened unasked, a pane is seated only from 144 columns (110 once the user has opened it before). Where it can't be seated, a toast says "Claude assigned you: … · /my-tasks".
 - **`/my-tasks` opens it** with the keyboard (`focus`), at any width, because the user asked.

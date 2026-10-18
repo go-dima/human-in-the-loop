@@ -34,8 +34,8 @@ RENDERS = os.environ.get('RENDERS_DIR')
 kept = 0
 
 
-def keep(session, name):
-    """Saves the screen as it is now under RENDERS_DIR, numbered in the order the tests read them."""
+def keep(styled, name):
+    """Saves a screen read with its escapes under RENDERS_DIR, numbered in the order the tests read them."""
     global kept
 
     if not RENDERS:
@@ -46,7 +46,21 @@ def keep(session, name):
     # Only what a file name and the artifact's upload both take.
     safe = re.sub(r'[^A-Za-z0-9._-]+', '_', name)
     with open(os.path.join(RENDERS, f'{kept:02d}-{safe}.ansi'), 'w') as f:
-        f.write(capture(session, escapes=True))
+        f.write(styled)
+
+
+# What `capture-pane -e` adds to the text: colors and styles, and any other CSI or OSC sequence.
+ESCAPES = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+
+
+def snapshot(session, name=None):
+    """The screen as text, read once and kept as `name` when given, colors and all: what is kept is what a test reads."""
+    styled = capture(session, escapes=True)
+    if name is not None:
+        keep(styled, name)
+    # As the plain capture reads it: that trims the spaces ending a row,
+    # styled ones too.
+    return '\n'.join(line.rstrip(' ') for line in ESCAPES.sub('', styled).split('\n'))
 
 
 def wait_for(session, predicate, timeout=30.0):
@@ -197,10 +211,7 @@ class Claude:
         # Keys that close the pane and open it again leave it to come back.
         wait_for(self.session, lambda s: '╰' in s)
         time.sleep(1.0)
-        screen = capture(self.session)
-        if name is not None:
-            keep(self.session, name)
-        return screen
+        return snapshot(self.session, name)
 
     def transcript(self, columns, rows, tool_input, name=None):
         """The screen of a session resumed from a transcript where Claude called assign_task; kept as `name` when given."""
@@ -234,10 +245,7 @@ class Claude:
         self.start(columns, rows, '--resume', session)
         wait_for(self.session, lambda s: '☐' in s)
         time.sleep(1.0)
-        screen = capture(self.session)
-        if name is not None:
-            keep(self.session, name)
-        return screen
+        return snapshot(self.session, name)
 
     def close(self):
         self.stop()

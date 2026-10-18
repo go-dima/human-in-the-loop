@@ -1,4 +1,4 @@
-import type { On, PaneOpenArgs, PromptSubmitInput, RenderSurface } from 'claude-code'
+import type { On, PaneOpenArgs, PromptSubmitInput } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 
@@ -85,8 +85,6 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     toasts: [] as string[],
     opens: [] as PaneOpenArgs[],
     isPaneOpen: false,
-    /** The surfaces the session draws on, as `$.session.surfaces()` answers. */
-    surfaces: ['terminal'] as RenderSurface[],
     isNarrow: false,
     status: undefined as string | undefined,
     composer: '',
@@ -202,7 +200,6 @@ function seat(on: On, store: Record<string, unknown> = {}) {
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.attach', ($, e) => ({ clientId: e.clientId }))
   on('session.detach', ($, e) => ({ clientId: e.clientId }))
-  on('session.surfaces', () => ({ value: world.surfaces }))
   on('session.root', () => ({ value: world.root }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__human-in-the-loop__${e.name}` } }))
@@ -514,7 +511,6 @@ describe('long titles', () => {
 
   test('drawn on two surfaces at once, the pane asks for the rows the narrower takes, and keeps them', async ($, on) => {
     const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
-    world.surfaces = ['terminal', 'mobile']
     await start($)
 
     await runTasks($)
@@ -529,7 +525,6 @@ describe('long titles', () => {
     expect(world.opens.length).toBe(opens)
 
     // The phone leaves: the pane fits the terminal.
-    world.surfaces = ['terminal']
     await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
     await clock.settle()
     expect(world.opens.at(-1)?.rows).toBe(12)
@@ -537,7 +532,6 @@ describe('long titles', () => {
 
   test('drawn by two clients of one surface, the pane asks for the rows the narrower takes, and keeps them', async ($, on) => {
     const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
-    world.surfaces = ['terminal', 'mobile']
     await start($)
     await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
     await $.session.attach({ surface: 'mobile', clientId: 'phone' })
@@ -554,16 +548,54 @@ describe('long titles', () => {
     await mobile.redraw(inline(32).props)
     expect(world.opens.length).toBe(opens)
 
-    // The phone leaves: the tablet drawing again, the pane fits it.
+    // The phone leaves: the tablet drawing again, the pane fits it, and
+    // follows it as it widens.
     await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
     await mobile.redraw(inline(60).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+
+    await mobile.redraw(inline(100).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(11)
+  })
+
+  test("of two clients of one surface, one drawing it otherwise again and again keeps the other's rows", async ($, on) => {
+    const { world } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+
+    await runTasks($)
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    // The tablet takes the keys and gives them back, turned one way and the other.
+    for (const [columns, isFocused] of [[60, false], [60, true], [90, false], [90, true]] as const) {
+      await mobile.redraw({ ...inline(columns).props, isFocused })
+    }
+
+    expect(world.opens.at(-1)?.rows).toBe(17)
+  })
+
+  test('a client of two leaving, the pane asks for none of the rows it took', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(60), surface: 'mobile' })
+    await mobile.redraw(inline(32).props)
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The phone leaves: the pane fits the terminal until the tablet draws again.
+    await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
     await clock.settle()
     expect(world.opens.at(-1)?.rows).toBe(12)
   })
 
   test('docked beside the transcript, the terminal asks for no rows of its own', async ($, on) => {
     const { world } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
-    world.surfaces = ['terminal', 'mobile']
     await start($)
 
     await runTasks($)
@@ -827,8 +859,8 @@ describe('the answer field', () => {
     expect((await again.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('Use the staging creds')
   })
 
-  test('a client attaching draws the field with what is typed in it', async ($, on) => {
-    const { world, clock } = seat(on)
+  test('a client attaching leaves a field drawn elsewhere the value it opened with, and the keys typed in it', async ($, on) => {
+    const { clock } = seat(on)
     await start($)
 
     await $.tool.call(XCODE_TASK)
@@ -836,11 +868,11 @@ describe('the answer field', () => {
     await ui.press({ key: 'answer' })
     await ui.input({ key: 'answer-1', text: 'Use the staging creds', kind: 'change' })
     await clock.settle()
-    world.surfaces = ['terminal', 'desktop']
     await $.session.attach({ surface: 'desktop', clientId: 'laptop' })
-    const laptop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    // The pane draws again: Claude assigns another task.
+    await $.tool.call(ANDROID_TASK)
 
-    expect((await laptop.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('Use the staging creds')
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('')
   })
 
   test('typed in, the field asks for the rows its text wraps to, and for one row less once the keys leave it', async ($, on) => {
@@ -1460,7 +1492,7 @@ describe('responding', () => {
     expect(world.status).toBe('☐ 1 task for you · /my-tasks')
   })
 
-  test('of two presses from one render, the response that lands first stands', async ($, on) => {
+  test("of two presses from one render, the response that lands first stands, and a toast says the other wasn't saved", async ($, on) => {
     const { world, clock } = seat(on)
     await start($)
 
@@ -1479,7 +1511,56 @@ describe('responding', () => {
     await clock.settle()
 
     expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Pick a pagination strategy for /feed: I chose "Cursor".'])
+    expect(world.toasts).toEqual(["Task #1 isn't open any more, so your response wasn't saved."])
+  })
+
+  test('the same press twice from one render answers once, says nothing, and holds back no batch under way', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(PAGING_TASK)
+    const ui = await $.ui.mount(PANE)
+    // The first press reads the task list late: the second lands meanwhile, and the batch starts.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const pressed = ui.press({ key: 'option-1' })
+    await clock.advance(1)
+    world.ops = []
+    await ui.press({ key: 'option-1' })
+    await clock.advance(500)
+    await pressed
+
+    // The press that found it answered changed nothing, so wrote nothing.
+    expect(world.ops).toEqual([`set ${keysOf('/repo').session('session-1')}`])
+
+    await clock.advance(300)
+
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Pick a pagination strategy for /feed: I chose "Cursor".'])
     expect(world.toasts).toEqual([])
+  })
+
+  test("an answer typed for a task answered meanwhile on another surface isn't saved, and a toast says so", async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Two failures', kind: 'change' })
+    await clock.settle()
+    // The answer reads the task list late: Done on the phone lands meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const answered = ui.input({ key: 'answer-1', text: 'Two failures' })
+    await clock.advance(1)
+    await phone.press({ key: 'done' })
+    await clock.advance(500)
+    await answered
+    await clock.advance(1000)
+
+    expect(world.toasts).toEqual(["Task #1 isn't open any more, so your response wasn't saved."])
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Run xcodebuild test on your Mac, paste the failures: Done.'])
   })
 })
 

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PromptSubmitResult, Register, RenderSurface, Timer, ToolSpec } from 'claude-code'
+import type { EngineInterface, PromptSubmitResult, Register, RenderElement, RenderSurface, Timer, ToolSpec } from 'claude-code'
 
 import type { Editing, Task, Took } from '../types'
 import {
@@ -103,11 +103,21 @@ const MAX_PANE_ROWS = 18
 /** How a surface draws the pane: its body's width, whether it draws a field and holds the keys, and whether it seats the pane inline. */
 type Seat = Pick<PaneView, 'canType' | 'isFocused'> & { columns: number; isInline: boolean }
 
+/** What goes under the selected task: an open field, across the pane's body, and the buttons, in the task's indent. */
+type Controls = readonly [field: RenderElement | null, buttons: RenderElement | null]
+
 /** An 80-column terminal's main screen: the pane's seat until a surface draws it. */
 const FIRST_SEAT: Seat = { columns: 76, canType: true, isFocused: false, isInline: true }
 
-function isSameSeat(one: Seat, other: Seat): boolean {
-  return one.columns === other.columns && one.canType === other.canType && one.isFocused === other.isFocused && one.isInline === other.isInline
+/** `seats` with `seat` among them: of seats alike but for their width, the narrowest stays, as it takes the most rows. */
+function seatsWith(seats: readonly Seat[], seat: Seat): readonly Seat[] {
+  const alike = seats.find(other => isAlike(other, seat))
+
+  return alike !== undefined && alike.columns <= seat.columns ? seats : [...seats.filter(other => other !== alike), seat]
+}
+
+function isAlike(one: Seat, other: Seat): boolean {
+  return one.canType === other.canType && one.isFocused === other.isFocused && one.isInline === other.isInline
 }
 
 const TOOLS: readonly ToolSpec[] = [
@@ -237,7 +247,7 @@ const live = {
    * Each field's draft as it opened, by `fieldKeyOf`: what it is drawn with.
    * It stays put while the field is typed in, as a value drawn anew puts the
    * field's text back to it, keys typed meanwhile lost; `reopenFields` brings
-   * it up to the draft where a field is drawn afresh.
+   * it up to the draft as the pane opens again.
    */
   opened: new Map<string, string>(),
   batch: null as Timer | null,
@@ -276,10 +286,11 @@ const live = {
   /** Whether a turn runs, in the engine's own word (the band's `isWorking`), once it has said. */
   engineWorking: undefined as boolean | undefined,
   /**
-   * Each surface drawing the pane, by `e.surface`, as it last drew it: as
-   * each of its clients did, as near as a render tells, which names no client.
+   * How each surface drawing the pane draws it, by `e.surface`: as it last
+   * did, or, drawn by two clients or more, every way since one came or went
+   * (by `seatsWith`), since a render names no client.
    */
-  seats: new Map<RenderSurface, Seat[]>(),
+  seats: new Map<RenderSurface, readonly Seat[]>(),
   /** The remote clients attached, by surface: two phones are two clients on one. */
   clients: new Map<RenderSurface, Set<string>>(),
   /** The key of the element the pane's focus ring last moved onto. */
@@ -668,37 +679,22 @@ export const register: Register = on => {
     )
   })
 
-  // A second client on a surface draws the pane at a width of its own, and
-  // its fields afresh.
+  // A second client on a surface (two phones) draws the pane at a width of its own.
   on('session.attach', async ($, e, next) => {
     const attached = await next(e)
     live.clients.set(e.surface, new Set(live.clients.get(e.surface)).add(e.clientId))
-    reopenFields()
     return attached
   })
 
-  // The last of a kind of surface gone, the pane fits the ones left.
+  // A client gone, the pane fits the ones left: no render says which of its
+  // surface's seats was its own, so they all go, and come back as the
+  // clients left draw the pane again.
   on('session.detach', async ($, e, next) => {
     const left = await next(e)
     live.clients.get(e.surface)?.delete(e.clientId)
-    const surfaces = await $.session.surfaces()
-
-    for (const surface of live.seats.keys()) {
-      if (!surfaces.includes(surface)) {
-        live.seats.delete(surface)
-      }
-    }
-
+    live.seats.delete(e.surface)
     void refit($)
     return left
-  })
-
-  // Its pane closed, the surface forgets what the fields held: drawn again,
-  // each opens with what was typed in it. Hide does the same in `hide`.
-  on('ui.close', { id: PANE }, async ($, e, next) => {
-    const closed = await next(e)
-    reopenFields()
-    return closed
   })
 
   // The ring on the open field lets the terminal wrap what is typed there:
@@ -728,10 +724,11 @@ export const register: Register = on => {
     // off the rest.
     const columns = e.props.bodyColumns
     const seat: Seat = { columns, canType: view.canType, isFocused: view.isFocused, isInline: e.props.placement === 'inline' }
-    // A surface with two clients keeps the latest seats that differ, one for
-    // each, or each client's drawing would resize the pane against the other.
-    const others = (live.seats.get(e.surface) ?? []).filter(other => !isSameSeat(other, seat))
-    live.seats.set(e.surface, [...others, seat].slice(-Math.max(1, live.clients.get(e.surface)?.size ?? 0)))
+    // Drawn by two clients, a surface keeps how each drew it, or each one's
+    // drawing would resize the pane against the other's: as a render names
+    // neither, every way it was drawn since a client came or went.
+    const isShared = (live.clients.get(e.surface)?.size ?? 0) > 1
+    live.seats.set(e.surface, isShared ? seatsWith(live.seats.get(e.surface) ?? [], seat) : [seat])
 
     const { shown, editing: field, isWorking: working } = view
 
@@ -740,7 +737,7 @@ export const register: Register = on => {
       return <Text dimColor>No tasks for you right now.</Text>
     }
 
-    if (seat.isInline && (await rowsWanted($)) !== live.rows) {
+    if (seat.isInline && (await rowsWanted($, view)) !== live.rows) {
       void fit($)
     }
 
@@ -793,13 +790,14 @@ export const register: Register = on => {
       </Box>
     )
 
-    const answerField = (task: Task, held: string | undefined) => {
+    const answerField = (task: Task, held: string | undefined): Controls => {
       if (Input === undefined) {
-        return null
+        return [null, null]
       }
 
       if (held !== undefined) {
-        return (
+        return [
+          null,
           <Box key="held" flexDirection="column">
             <Text color="yellow" wrap="wrap">
               {HELD}
@@ -808,84 +806,76 @@ export const register: Register = on => {
               <Button key="edit" plain label="Edit" onPress={() => startEditing($, task.id, 'answer')} />
               <Button key="send-anyway" plain label="Send anyway" onPress={() => answer($, task.id, held, 'auto', true)} />
             </Box>
-          </Box>
-        )
+          </Box>,
+        ]
       }
 
       const key = fieldKeyOf({ id: task.id, field: 'answer' })
       const submitLabel = submitLabelOf('answer', view)
       const [otherWay, long, cancel] = answerButtonsOf(view)
 
-      // The terminal sizes a field by the pane's body, whatever box holds it:
-      // it takes the body's whole width, out of the task's indent.
-      return (
-        <Box key="field" flexDirection="column">
-          <Box marginLeft={-2}>
-            <Input
-              key={key}
-              label={ANSWER_LABEL}
-              placeholder={placeholderOf(answerPlaceholderOf(view), ANSWER_LABEL, submitLabel, columns)}
-              value={live.opened.get(key) ?? ''}
-              submitLabel={submitLabel}
-              autoFocus
-              onInput={value => typed($, key, value)}
-              onSubmit={value => answer($, task.id, value, 'auto')}
-            />
-          </Box>
-          <Box flexDirection="row" flexWrap="wrap" columnGap={BUTTON_GAP}>
-            <Button
-              key="other-way"
-              plain
-              label={otherWay}
-              onPress={() => answer($, task.id, live.drafts.get(key) ?? '', working ? 'now' : 'later')}
-            />
-            <Button key="long" plain label={long} onPress={() => longAnswer($, task.id)} />
-            <Button key="cancel" plain label={cancel} onPress={() => stopEditing($)} />
-          </Box>
-        </Box>
-      )
+      return [
+        <Input
+          key={key}
+          label={ANSWER_LABEL}
+          placeholder={placeholderOf(answerPlaceholderOf(view), ANSWER_LABEL, submitLabel, columns)}
+          value={live.opened.get(key) ?? ''}
+          submitLabel={submitLabel}
+          autoFocus
+          onInput={value => typed($, key, value)}
+          onSubmit={value => answer($, task.id, value, 'auto')}
+        />,
+        <Box key="buttons" flexDirection="row" flexWrap="wrap" columnGap={BUTTON_GAP}>
+          <Button
+            key="other-way"
+            plain
+            label={otherWay}
+            onPress={() => answer($, task.id, live.drafts.get(key) ?? '', working ? 'now' : 'later')}
+          />
+          <Button key="long" plain label={long} onPress={() => longAnswer($, task.id)} />
+          <Button key="cancel" plain label={cancel} onPress={() => stopEditing($)} />
+        </Box>,
+      ]
     }
 
-    const reasonField = (task: Task) => {
+    const reasonField = (task: Task): Controls => {
       if (Input === undefined) {
-        return null
+        return [null, null]
       }
 
       const key = fieldKeyOf({ id: task.id, field: 'reason' })
       const submitLabel = submitLabelOf('reason', view)
 
-      return (
-        <Box key="field" flexDirection="column">
-          <Box marginLeft={-2}>
-            <Input
-              key={key}
-              label={REASON_LABEL}
-              placeholder={placeholderOf(REASON_PLACEHOLDER, REASON_LABEL, submitLabel, columns)}
-              value={live.opened.get(key) ?? ''}
-              submitLabel={submitLabel}
-              autoFocus
-              onInput={value => typed($, key, value)}
-              onSubmit={value => {
-                const reason = oneLine(value)
-                return respond($, task.id, { state: 'rejected', ...(reason === '' ? {} : { reason }) }, 'auto')
-              }}
-            />
-          </Box>
-          <Button key="cancel" plain label="Cancel" onPress={() => stopEditing($)} />
-        </Box>
-      )
+      return [
+        <Input
+          key={key}
+          label={REASON_LABEL}
+          placeholder={placeholderOf(REASON_PLACEHOLDER, REASON_LABEL, submitLabel, columns)}
+          value={live.opened.get(key) ?? ''}
+          submitLabel={submitLabel}
+          autoFocus
+          onInput={value => typed($, key, value)}
+          onSubmit={value => {
+            const reason = oneLine(value)
+            return respond($, task.id, { state: 'rejected', ...(reason === '' ? {} : { reason }) }, 'auto')
+          }}
+        />,
+        <Button key="cancel" plain label="Cancel" onPress={() => stopEditing($)} />,
+      ]
     }
 
     const selectedRows = (task: Task) => {
       // A field open on a surface that draws one: elsewhere the task keeps its buttons.
       const isEditing = view.canType && field !== null && field.id === task.id
-      const control = !isEditing
-        ? actionsOf(task)
+      const [input, buttons]: Controls = !isEditing
+        ? [null, actionsOf(task)]
         : field.field === 'answer'
           ? answerField(task, field.held)
           : reasonField(task)
       const doneWhen = doneWhenOf(task)
 
+      // The terminal sizes a field by the pane's body, whatever box holds it:
+      // it goes out of the task's indent, across the body's whole width.
       return (
         <Box key={`task-${task.id}`} flexDirection="column" flexShrink={0}>
           <Box flexDirection="row">
@@ -899,7 +889,10 @@ export const register: Register = on => {
                 {doneWhen}
               </Text>
             )}
-            {control}
+          </Box>
+          {input}
+          <Box flexDirection="column" paddingLeft={2}>
+            {buttons}
           </Box>
         </Box>
       )
@@ -951,7 +944,7 @@ export const register: Register = on => {
             {hintOf(view)}
           </Text>
           <Box flexShrink={0}>
-            <Button key="hide" plain dimColor role="dismiss" label={HIDE} onPress={() => hide($)} />
+            <Button key="hide" plain dimColor role="dismiss" label={HIDE} onPress={() => $.ui.close({ id: PANE })} />
           </Box>
         </Box>
       </Box>
@@ -1435,15 +1428,25 @@ async function wake($: EngineInterface) {
 }
 
 /**
- * Changes the task list and writes the slot, reading nothing (see `wake`).
- * The session's own state is what counts: a write that fails now, the
- * heartbeat makes.
+ * Changes the task list and, when that changes it (`fn` hands back a new
+ * list), writes the slot, reading nothing (see `wake`). The session's own
+ * state is what counts: a write that fails now, the heartbeat makes.
  */
 async function change($: EngineInterface, fn: (list: readonly Task[]) => readonly Task[]) {
   await wake($)
-  await update($, tasks, fn)
-  await awaited($, queued(() => writeOwn($)))
-  await refresh($)
+  let isChanged = false
+
+  // `update` runs `fn` again when another write beat it: the last run counts.
+  await update($, tasks, list => {
+    const changed = fn(list)
+    isChanged = changed !== list
+    return changed
+  })
+
+  if (isChanged) {
+    await awaited($, queued(() => writeOwn($)))
+    await refresh($)
+  }
 }
 
 /**
@@ -1490,6 +1493,15 @@ async function refresh($: EngineInterface): Promise<boolean> {
  * surface seated it: one opened unasked waits on a narrow terminal.
  */
 async function show($: EngineInterface, isAsked: boolean): Promise<boolean> {
+  // A closed pane's fields are drawn afresh as it opens again (the surface
+  // forgets what they held as it closes), and none is drawn meanwhile, whose
+  // text a value drawn anew would put back.
+  const panes = await $.ui.panes().catch(() => undefined)
+
+  if (panes !== undefined && !panes.some(pane => pane.id === PANE)) {
+    reopenFields()
+  }
+
   return openAt($, await rowsWanted($), isAsked)
 }
 
@@ -1508,9 +1520,8 @@ async function openAt($: EngineInterface, rows: number, isAsked: boolean): Promi
 /** What the pane draws from: the session's state, and what only the surface knows. */
 async function paneView($: EngineInterface, surface: Pick<PaneView, 'canType' | 'isFocused'>): Promise<PaneView> {
   const field = await read($, editing)
-  const key = field === null || field.held !== undefined ? undefined : fieldKeyOf(field)
-
-  return {
+  const key = openKeyOf(field)
+  const state = {
     shown: (await read($, tasks)).filter(isShown),
     selectedId: await read($, selectedId),
     editing: field,
@@ -1518,10 +1529,26 @@ async function paneView($: EngineInterface, surface: Pick<PaneView, 'canType' | 
     nowMs: await $.clock.now(),
     sessionId: await $.session.id(),
     isWorking: await read($, isWorking),
+  }
+
+  return seated(state, surface)
+}
+
+/** The pane's `view` as a surface that `canType`, and holds the keys or not, draws it. */
+function seated(view: Omit<PaneView, 'canType' | 'isFocused' | 'isTyping'>, surface: Pick<PaneView, 'canType' | 'isFocused'>): PaneView {
+  const key = openKeyOf(view.editing)
+
+  return {
+    ...view,
     canType: surface.canType,
     isFocused: surface.isFocused,
     isTyping: surface.canType && surface.isFocused && key !== undefined && live.ring === key,
   }
+}
+
+/** The key of the field open to type in, unless an answer held there for looking like a secret takes its place. */
+function openKeyOf(field: Editing | null): string | undefined {
+  return field === null || field.held !== undefined ? undefined : fieldKeyOf(field)
 }
 
 /** Re-sizes the pane to what it holds now, when it is on screen. */
@@ -1550,15 +1577,14 @@ async function refit($: EngineInterface) {
 /**
  * The rows the pane asks for: the most it takes on a surface seating it
  * inline. It is one height on all of them, and each asking for its own
- * would resize it against the others.
+ * would resize it against the others. From `view` when a render has just
+ * read it, else from the state now.
  */
-async function rowsWanted($: EngineInterface): Promise<number> {
+async function rowsWanted($: EngineInterface, view?: PaneView): Promise<number> {
   const inline = [...live.seats.values()].flat().filter(seat => seat.isInline)
-  const rows = await Promise.all(
-    (inline.length > 0 ? inline : [FIRST_SEAT]).map(async seat => rowsFor(await paneView($, seat), seat.columns, MAX_PANE_ROWS)),
-  )
+  const state = view ?? (await paneView($, FIRST_SEAT))
 
-  return Math.max(...rows)
+  return Math.max(...(inline.length > 0 ? inline : [FIRST_SEAT]).map(seat => rowsFor(seated(state, seat), seat.columns, MAX_PANE_ROWS)))
 }
 
 /** Keeps what the user typed in the field keyed `key`, and the rows it takes. */
@@ -1714,7 +1740,8 @@ async function resolve($: EngineInterface, id: number, patch: Pick<Task, 'state'
   const was = await edit($, id, task => ({ ...task, ...patch, update: 'pending' }))
   await settle($, id)
 
-  if (how === 'now' || (how === 'auto' && !working())) {
+  // One no longer open sends nothing new, and holds back no batch under way.
+  if (was !== undefined && isActive(was) && (how === 'now' || (how === 'auto' && !working()))) {
     sendSoon($)
   }
 
@@ -1723,13 +1750,15 @@ async function resolve($: EngineInterface, id: number, patch: Pick<Task, 'state'
 
 /**
  * A press on the pane resolves task `id`, as `resolve` does. One Claude
- * withdrew, or another session took on, since the pane drew it says so; one
- * already answered (a second press) stays answered.
+ * withdrew, another session took on, or the user answered otherwise (on
+ * another surface, say) since the pane drew it says so; one already answered
+ * as this press would answer it (a second press) stays answered.
  */
 async function respond($: EngineInterface, id: number, patch: Pick<Task, 'state'> & Partial<Task>, how: How) {
   const was = await resolve($, id, patch, how)
+  const isRepeat = was !== undefined && was.state === patch.state && was.answer === patch.answer && was.reason === patch.reason
 
-  if (was === undefined || was.state === 'withdrawn') {
+  if (was === undefined || (!isActive(was) && !isRepeat)) {
     $.ui.toast(`Task #${id} isn't open any more, so your response wasn't saved.`)
   }
 }
@@ -1763,15 +1792,6 @@ async function startEditing($: EngineInterface, id: number, field: Editing['fiel
 
   // A field the pane can't focus (it doesn't hold the keyboard) is still a click away.
   void $.ui.focus({ requestId: PANE, key }).then(undefined, () => undefined)
-}
-
-/**
- * Hide: closes the pane. A press raises none of the plugin's own hooks, so
- * it does here what its `ui.close` hook does for the person's close.
- */
-async function hide($: EngineInterface) {
-  await $.ui.close({ id: PANE })
-  reopenFields()
 }
 
 /** Has each field drawn afresh open with what is typed in it so far. */

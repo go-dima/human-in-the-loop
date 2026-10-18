@@ -1968,6 +1968,40 @@ describe('responding', () => {
     expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved.")
   })
 
+  test('Save for later pressed as its task is answered from the prompt box says nothing', async ($, on) => {
+    const { world, clock } = seat(on)
+    // Held, a press reaches its button once the test lets it go.
+    let isHeld = false
+    let letGo = () => {}
+    on('ui.press', async ($, e, next) => {
+      if (isHeld) {
+        isHeld = false
+        await new Promise<void>(resolve => {
+          letGo = resolve
+        })
+      }
+
+      return next(e)
+    })
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await clock.settle()
+    // Save for later reaches its button as the answer typed in the prompt
+    // box lands, before the drawing that answer wakes: it stands.
+    isHeld = true
+    const pressed = ui.press({ key: 'other-way' })
+    await $.prompt.submit(typed('↳ Answer to #1: Two failures'))
+    letGo()
+    await pressed
+
+    expect(world.toasts).toEqual([])
+  })
+
   test('a task withdrawn as the user types for it takes the drafts along, and leaves the prompt box as the user has it', async ($, on) => {
     const { world, clock } = seat(on)
     await start($)

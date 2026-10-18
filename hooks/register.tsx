@@ -1883,12 +1883,13 @@ async function answer($: EngineInterface, id: number, text: string, how: How, is
 
   if (value === '') {
     // A button pressed on a drawing from before its task closed finds the
-    // draft gone with the task.
-    const isOpen = (await read($, tasks)).some(task => task.id === id && isActive(task))
+    // draft gone with the task. One answered meanwhile (a second press, say)
+    // stands as answered, and the press says nothing.
+    const task = (await read($, tasks)).find(one => one.id === id)
 
-    if (isOpen) {
+    if (task !== undefined && isActive(task)) {
       $.ui.toast('Type an answer first, or press Cancel.')
-    } else {
+    } else if (task?.state !== 'done') {
       $.ui.toast(`Task #${id} isn't open any more, so your response wasn't saved.`, { timeoutMs: 8000 })
     }
 

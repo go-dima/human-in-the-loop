@@ -51,6 +51,9 @@ SAVED = [
     {'id': 5, 'title': LONG, 'why': 'It leaked.', 'state': 'done', 'update': 'pending'},
 ]
 
+# An answer longer than its field's row, with a word longer than the row too.
+DRAFT = 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding'
+
 
 def flat(text):
     """Text as one line: the pane's wrapping and the frame's padding gone."""
@@ -67,7 +70,8 @@ class Pane(unittest.TestCase):
         claude = Claude(ROOT)
         try:
             claude.seed(tasks)
-            name = '-'.join([self._testMethodName, str(columns), *keys])
+            # Text typed goes by `typed` in the name, a key by its own.
+            name = '-'.join([self._testMethodName, str(columns), *('typed' if ' ' in key else key for key in keys)])
             screen = claude.pane(columns, HEIGHT, keys, name=name)
         finally:
             claude.close()
@@ -147,8 +151,29 @@ class Pane(unittest.TestCase):
                 text = joined(body)
 
                 self.assert_fits(body, context)
-                self.assertIn('Answer ›', text, context)
+                # Across the body's whole width, which the terminal sizes a field by.
+                self.assertTrue(any(row.startswith('Answer: ') for row in body), context)
                 self.assertIn('Cancel', text, context)
+
+    def test_a_long_answer_wraps_in_its_field_and_the_pane_grows_to_hold_it(self):
+        # Typed after Answer…: the keys go to the field, not to the pane's hotkeys.
+        for columns in (36, 64):
+            with self.subTest(columns=columns):
+                body, context = self.draw(TASKS[1:2], columns, keys=('r', DRAFT))
+
+                self.assert_fits(body, context)
+                # Whole, wrapped beside the label, the hint after its first row.
+                self.assertIn(DRAFT.replace(' ', ''), joined(body).replace('⏎ send', '').replace(' ', ''), context)
+                self.assertIn('Cancel', joined(body), context)
+
+    def test_a_long_answer_out_of_the_keys_keeps_the_pane_fitted(self):
+        # Tab moves the keys on: the field draws one row of its text, the label squeezed onto a second.
+        for columns in (36, 64):
+            with self.subTest(columns=columns):
+                body, context = self.draw(TASKS[1:2], columns, keys=('r', DRAFT, 'Tab'))
+
+                self.assert_fits(body, context)
+                self.assertIn('Cancel', joined(body), context)
 
 
 class TranscriptRow(unittest.TestCase):

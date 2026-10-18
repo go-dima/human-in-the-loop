@@ -34,12 +34,15 @@ import {
   answerButtonsOf,
   answerPlaceholderOf,
   doneWhenOf,
+  fieldKeyOf,
   headlineOf,
   hintOf,
   nameOf,
+  placeholderOf,
   rowsFor,
   savedOf,
   selectedOf,
+  submitLabelOf,
   titleOf,
   whyOf,
 } from './pane'
@@ -217,8 +220,14 @@ const live = {
   isUnread: false,
   /** A Send now the running turn could not take: it goes once the turn ends. */
   isSendingAtEnd: false,
-  /** What the user has typed in an answer field so far, by task. */
-  drafts: new Map<number, string>(),
+  /** What the user has typed in each field so far, by `fieldKeyOf`. */
+  drafts: new Map<string, string>(),
+  /**
+   * Each field's draft as it opened, by `fieldKeyOf`: what it is drawn with.
+   * It stays put while the field is typed in, as a value drawn anew puts the
+   * field's text back to it, keys typed meanwhile lost.
+   */
+  opened: new Map<string, string>(),
   batch: null as Timer | null,
   /** Says in the project's store that this session is alive. */
   heartbeat: null as Timer | null,
@@ -261,6 +270,10 @@ const live = {
   columns: 76,
   canType: true,
   isFocused: false,
+  /** The pane is seated inline above the prompt, where it asks for the rows it takes. */
+  isInline: false,
+  /** The key of the element the pane's focus ring last moved onto. */
+  ring: undefined as string | undefined,
   /** The rows the pane last asked for. */
   rows: 0,
 }
@@ -645,6 +658,19 @@ export const register: Register = on => {
     )
   })
 
+  // The ring on the open field lets the terminal wrap what is typed there:
+  // the pane asks for the rows that takes, and for one row once it leaves.
+  on('ui.focus', { requestId: PANE }, async ($, e, next) => {
+    const moved = await next(e)
+
+    if (moved.deny === undefined) {
+      live.ring = e.element
+      void refit($)
+    }
+
+    return moved
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements
@@ -659,6 +685,7 @@ export const register: Register = on => {
     live.columns = e.props.bodyColumns
     live.canType = view.canType
     live.isFocused = view.isFocused
+    live.isInline = e.props.placement === 'inline'
 
     const { shown, editing: field, isWorking: working } = view
 
@@ -667,7 +694,7 @@ export const register: Register = on => {
       return <Text dimColor>No tasks for you right now.</Text>
     }
 
-    if (e.props.placement === 'inline' && rowsFor(view, live.columns, MAX_PANE_ROWS) !== live.rows) {
+    if (live.isInline && rowsFor(view, live.columns, MAX_PANE_ROWS) !== live.rows) {
       void fit($)
     }
 
@@ -732,35 +759,39 @@ export const register: Register = on => {
               {HELD}
             </Text>
             <Box flexDirection="row" flexWrap="wrap" columnGap={BUTTON_GAP}>
-              <Button key="edit" plain label="Edit" onPress={() => update($, editing, (): Editing => ({ id: task.id, field: 'answer' }))} />
+              <Button key="edit" plain label="Edit" onPress={() => startEditing($, task.id, 'answer')} />
               <Button key="send-anyway" plain label="Send anyway" onPress={() => answer($, task.id, held, 'auto', true)} />
             </Box>
           </Box>
         )
       }
 
+      const key = fieldKeyOf({ id: task.id, field: 'answer' })
+      const submitLabel = submitLabelOf('answer', view)
       const [otherWay, long, cancel] = answerButtonsOf(view)
 
+      // The terminal sizes a field by the pane's body, whatever box holds it:
+      // it takes the body's whole width, out of the task's indent.
       return (
         <Box key="field" flexDirection="column">
-          <Input
-            key="answer"
-            label={ANSWER_LABEL}
-            placeholder={answerPlaceholderOf(view)}
-            value={live.drafts.get(task.id) ?? ''}
-            submitLabel={working ? 'save' : 'send'}
-            autoFocus
-            onInput={value => {
-              live.drafts.set(task.id, value)
-            }}
-            onSubmit={value => answer($, task.id, value, 'auto')}
-          />
+          <Box marginLeft={-2}>
+            <Input
+              key={key}
+              label={ANSWER_LABEL}
+              placeholder={placeholderOf(answerPlaceholderOf(view), ANSWER_LABEL, submitLabel, live.columns)}
+              value={live.opened.get(key) ?? ''}
+              submitLabel={submitLabel}
+              autoFocus
+              onInput={value => typed($, key, value)}
+              onSubmit={value => answer($, task.id, value, 'auto')}
+            />
+          </Box>
           <Box flexDirection="row" flexWrap="wrap" columnGap={BUTTON_GAP}>
             <Button
               key="other-way"
               plain
               label={otherWay}
-              onPress={() => answer($, task.id, live.drafts.get(task.id) ?? '', working ? 'now' : 'later')}
+              onPress={() => answer($, task.id, live.drafts.get(key) ?? '', working ? 'now' : 'later')}
             />
             <Button key="long" plain label={long} onPress={() => longAnswer($, task.id)} />
             <Button key="cancel" plain label={cancel} onPress={() => stopEditing($)} />
@@ -774,19 +805,26 @@ export const register: Register = on => {
         return null
       }
 
+      const key = fieldKeyOf({ id: task.id, field: 'reason' })
+      const submitLabel = submitLabelOf('reason', view)
+
       return (
         <Box key="field" flexDirection="column">
-          <Input
-            key="reason"
-            label={REASON_LABEL}
-            placeholder={REASON_PLACEHOLDER}
-            submitLabel="reject"
-            autoFocus
-            onSubmit={value => {
-              const reason = oneLine(value)
-              return respond($, task.id, { state: 'rejected', ...(reason === '' ? {} : { reason }) }, 'auto')
-            }}
-          />
+          <Box marginLeft={-2}>
+            <Input
+              key={key}
+              label={REASON_LABEL}
+              placeholder={placeholderOf(REASON_PLACEHOLDER, REASON_LABEL, submitLabel, live.columns)}
+              value={live.opened.get(key) ?? ''}
+              submitLabel={submitLabel}
+              autoFocus
+              onInput={value => typed($, key, value)}
+              onSubmit={value => {
+                const reason = oneLine(value)
+                return respond($, task.id, { state: 'rejected', ...(reason === '' ? {} : { reason }) }, 'auto')
+              }}
+            />
+          </Box>
           <Button key="cancel" plain label="Cancel" onPress={() => stopEditing($)} />
         </Box>
       )
@@ -915,6 +953,7 @@ async function join($: EngineInterface, ends = live.ends) {
       await update($, editing, () => null)
       await update($, loadedFor, () => null)
       live.drafts.clear()
+      live.opened.clear()
       live.held.clear()
       live.batch?.cancel()
       live.batch = null
@@ -1419,17 +1458,19 @@ async function show($: EngineInterface, isAsked: boolean): Promise<boolean> {
 /** What the pane draws from: the session's state, and what only the surface knows. */
 async function paneView($: EngineInterface, surface: Pick<PaneView, 'canType' | 'isFocused'>): Promise<PaneView> {
   const field = await read($, editing)
+  const key = field === null || field.held !== undefined ? undefined : fieldKeyOf(field)
 
   return {
     shown: (await read($, tasks)).filter(isShown),
     selectedId: await read($, selectedId),
     editing: field,
-    draft: field === null ? '' : (live.drafts.get(field.id) ?? ''),
+    draft: key === undefined ? '' : (live.drafts.get(key) ?? ''),
     nowMs: await $.clock.now(),
     sessionId: await $.session.id(),
     isWorking: await read($, isWorking),
     canType: surface.canType,
     isFocused: surface.isFocused,
+    isTyping: surface.canType && surface.isFocused && key !== undefined && live.ring === key,
   }
 }
 
@@ -1440,6 +1481,22 @@ async function fit($: EngineInterface) {
   if (panes.some(pane => pane.id === PANE && pane.isPlaced)) {
     await show($, false)
   }
+}
+
+/**
+ * Re-sizes an inline pane whose rows changed with what nothing draws it
+ * again for: a draft growing, the ring moving onto its field or off it.
+ */
+async function refit($: EngineInterface) {
+  if (live.isInline && rowsFor(await paneView($, live), live.columns, MAX_PANE_ROWS) !== live.rows) {
+    await fit($)
+  }
+}
+
+/** Keeps what the user typed in the field keyed `key`, and the rows it takes. */
+async function typed($: EngineInterface, key: string, value: string) {
+  live.drafts.set(key, value)
+  await refit($)
 }
 
 /**
@@ -1560,7 +1617,11 @@ async function undelivered($: EngineInterface, ids: readonly number[]) {
 
 /** Keeps the selection on a task still open, and drops a field whose task is gone. */
 async function settle($: EngineInterface, id: number) {
-  live.drafts.delete(id)
+  for (const field of ['answer', 'reason'] as const) {
+    live.drafts.delete(fieldKeyOf({ id, field }))
+    live.opened.delete(fieldKeyOf({ id, field }))
+  }
+
   await update($, editing, field => (field?.id === id ? null : field))
   await reselect($)
 }
@@ -1622,12 +1683,15 @@ async function answer($: EngineInterface, id: number, text: string, how: How, is
 }
 
 async function startEditing($: EngineInterface, id: number, field: Editing['field']) {
+  const key = fieldKeyOf({ id, field })
+
+  live.opened.set(key, live.drafts.get(key) ?? '')
   await update($, selectedId, () => id)
   await update($, editing, (): Editing => ({ id, field }))
   await fit($)
 
   // A field the pane can't focus (it doesn't hold the keyboard) is still a click away.
-  void $.ui.focus({ requestId: PANE, key: field }).then(undefined, () => undefined)
+  void $.ui.focus({ requestId: PANE, key }).then(undefined, () => undefined)
 }
 
 async function stopEditing($: EngineInterface) {
@@ -1637,8 +1701,9 @@ async function stopEditing($: EngineInterface) {
 
 /** Moves a long answer into the prompt box, where the real editor takes pastes and lines. */
 async function longAnswer($: EngineInterface, id: number) {
+  const key = fieldKeyOf({ id, field: 'answer' })
   const box = await $.prompt.read()
-  const draft = live.drafts.get(id) ?? ''
+  const draft = live.drafts.get(key) ?? ''
   const text = bridgeOf(id) + [draft, box.text].filter(part => part.trim() !== '').join('\n')
   const filled = await $.prompt.fill({ text, mode: 'replace' })
 
@@ -1647,7 +1712,7 @@ async function longAnswer($: EngineInterface, id: number) {
     return
   }
 
-  live.drafts.delete(id)
+  live.drafts.delete(key)
   await update($, editing, () => null)
   $.ui.toast('Write your answer in the prompt box (Esc gets you there), then press Enter.', {
     timeoutMs: 8000,

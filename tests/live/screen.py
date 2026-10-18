@@ -43,7 +43,9 @@ def keep(session, name):
 
     kept += 1
     os.makedirs(RENDERS, exist_ok=True)
-    with open(os.path.join(RENDERS, f'{kept:02d}-{name}.ansi'), 'w') as f:
+    # Only what a file name and the artifact's upload both take.
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', name)
+    with open(os.path.join(RENDERS, f'{kept:02d}-{safe}.ansi'), 'w') as f:
         f.write(capture(session, escapes=True))
 
 

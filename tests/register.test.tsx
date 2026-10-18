@@ -1081,6 +1081,74 @@ describe('responding', () => {
 
     expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#2 Add STRIPE_SECRET_KEY to .env: Done.'])
   })
+
+  test('a withdraw that meets an answer given a moment before leaves the answer, and Claude hears it', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+    // The withdraw reads the task list late: Done lands meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const withdrawn = $.tool.call({ tool: WITHDRAW, id: 1, reason: 'Found the key in the vault' })
+    await clock.advance(1)
+    await ui.press({ key: 'done' })
+    await clock.advance(500)
+
+    expect(((await withdrawn) as { deny?: string }).deny).toBe('Task #1 is already done; there is nothing to withdraw.')
+    expect(world.toasts).toEqual([])
+
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Add STRIPE_SECRET_KEY to .env: Done.'])
+  })
+
+  test('a press from a render older than a withdraw leaves the task withdrawn, and a toast says so', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    // Done reads the task list late: Claude withdraws #1 meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const pressed = ui.press({ key: 'done' })
+    await clock.advance(1)
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    await clock.advance(500)
+    await pressed
+    await clock.settle()
+
+    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved.")
+    expect(world.submitted).toEqual([])
+    expect(world.status).toBe('☐ 1 task for you · /my-tasks')
+  })
+
+  test('of two presses from one render, the response that lands first stands', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(PAGING_TASK)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+    // Offset reads the task list late: Cursor lands meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const pressed = ui.press({ key: 'option-2' })
+    await clock.advance(1)
+    await ui.press({ key: 'option-1' })
+    await clock.advance(500)
+    await pressed
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Pick a pagination strategy for /feed: I chose "Cursor".'])
+    expect(world.toasts).toEqual([])
+  })
 })
 
 describe('long answers in the prompt box', () => {
@@ -1166,6 +1234,29 @@ describe('long answers in the prompt box', () => {
 
     const listed = await $.tool.call({ tool: LIST })
     expect(String((listed as { result?: unknown }).result)).toContain('Two failures')
+  })
+
+  test('typed while Claude works, an answer to a task Claude withdraws meanwhile goes as typed', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    // The prompt reads the task list late: Claude withdraws #1 meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const sending = $.prompt.submit(typed('↳ Answer to #1: Two failures', 't1'))
+    await clock.advance(1)
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    await clock.advance(500)
+    const sent = await sending
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    expect(sent.drop).toBeUndefined()
+    expect(sent.text).toBe('↳ Answer to #1: Two failures')
+    expect(sent.context).toBeUndefined()
+    expect(world.submitted).toEqual([])
   })
 })
 

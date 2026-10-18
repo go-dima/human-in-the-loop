@@ -449,26 +449,30 @@ export const register: Register = on => {
     const id = args['id']
     const reason = typeof args['reason'] === 'string' ? oneLine(args['reason']) : ''
     const task = (await read($, tasks)).find(one => one.id === id)
+    // Withdrawn only while it is open: an answer the user gave a moment before stands.
+    const found =
+      task === undefined || !isActive(task)
+        ? task
+        : await edit($, task.id, one => ({
+            ...one,
+            state: 'withdrawn',
+            update: 'delivered',
+            ...(reason === '' ? {} : { reason }),
+          }))
 
-    if (task === undefined) {
+    if (found === undefined) {
       return { deny: `No task #${String(id)}.` }
     }
 
-    if (!isActive(task)) {
-      return { deny: `Task #${task.id} is already ${task.state}; there is nothing to withdraw.` }
+    if (!isActive(found)) {
+      return { deny: `Task #${found.id} is already ${found.state}; there is nothing to withdraw.` }
     }
 
-    await edit($, task.id, one => ({
-      ...one,
-      state: 'withdrawn',
-      update: 'delivered',
-      ...(reason === '' ? {} : { reason }),
-    }))
-    await settle($, task.id)
+    await settle($, found.id)
     const why = reason === '' ? '' : `. ${printable(reason, 200)}`
-    $.ui.toast(`Claude withdrew the task: ${printable(task.title, MAX_TITLE)}${why}`, { timeoutMs: 8000 })
+    $.ui.toast(`Claude withdrew the task: ${printable(found.title, MAX_TITLE)}${why}`, { timeoutMs: 8000 })
 
-    return { result: `Withdrew task #${task.id}; it is gone from the user's My tasks pane.` }
+    return { result: `Withdrew task #${found.id}; it is gone from the user's My tasks pane.` }
   })
 
   on('turn.start', async ($, e, next) => {
@@ -542,6 +546,7 @@ export const register: Register = on => {
     await wake($)
     const bridged = answerIn(e.text)
     const task = bridged === null ? undefined : (await read($, tasks)).find(one => one.id === bridged.id && isActive(one))
+    let isAnswered = false
 
     if (bridged !== null && task !== undefined) {
       if (looksSecret(bridged.answer)) {
@@ -552,27 +557,32 @@ export const register: Register = on => {
 
       const given = bridged.answer === '' ? {} : { answer: bridged.answer }
 
-      if (e.turnId !== undefined) {
-        await resolve($, task.id, { state: 'done', ...given }, 'later')
+      if (e.turnId === undefined) {
+        // Claude is idle: this prompt is the answer, sent with every other
+        // update Claude has not heard, those a batch was about to send among them.
+        live.batch?.cancel()
+        live.batch = null
+      }
+
+      // A task closed meanwhile (Claude withdrew it, say) keeps no answer:
+      // the prompt goes as typed.
+      const was = await resolve($, task.id, { state: 'done', ...given }, 'later')
+      isAnswered = was !== undefined && isActive(was)
+
+      if (isAnswered && e.turnId !== undefined) {
         const when = (await read($, tasks)).some(isActive) ? 'with your other answers' : 'when this turn ends'
 
         return {
           drop: `Saved as your answer to #${task.id}. Claude gets it ${when}, or press Send now in /my-tasks.`,
         }
       }
-
-      // Claude is idle: this prompt is the answer, sent with every other
-      // update Claude has not heard, those a batch was about to send among them.
-      live.batch?.cancel()
-      live.batch = null
-      await resolve($, task.id, { state: 'done', ...given }, 'later')
     }
 
     const due = await claim($)
     // A task still here has its answer in this prompt, or in another send
     // that took it as it was saved. One gone meanwhile (another session took
     // it on) leaves the prompt as typed.
-    const isAnswer = task !== undefined && (await read($, tasks)).some(one => one.id === task.id)
+    const isAnswer = isAnswered && task !== undefined && (await read($, tasks)).some(one => one.id === task.id)
 
     if (isAnswer && due.length === 0) {
       return { drop: `Your answer to #${task.id} already went to Claude.` }
@@ -691,18 +701,18 @@ export const register: Register = on => {
             label={action.label}
             onPress={() => {
               if (action.option !== undefined) {
-                return resolve($, task.id, { state: 'done', answer: action.option }, 'auto')
+                return respond($, task.id, { state: 'done', answer: action.option }, 'auto')
               }
 
               if (action.key === 'done') {
-                return resolve($, task.id, { state: 'done' }, 'auto')
+                return respond($, task.id, { state: 'done' }, 'auto')
               }
 
               if (action.key === 'answer') {
                 return startEditing($, task.id, 'answer')
               }
 
-              return view.canType ? startEditing($, task.id, 'reason') : resolve($, task.id, { state: 'rejected' }, 'auto')
+              return view.canType ? startEditing($, task.id, 'reason') : respond($, task.id, { state: 'rejected' }, 'auto')
             }}
           />
         ))}
@@ -773,7 +783,7 @@ export const register: Register = on => {
             autoFocus
             onSubmit={value => {
               const reason = oneLine(value)
-              return resolve($, task.id, { state: 'rejected', ...(reason === '' ? {} : { reason }) }, 'auto')
+              return respond($, task.id, { state: 'rejected', ...(reason === '' ? {} : { reason }) }, 'auto')
             }}
           />
           <Button key="cancel" plain label="Cancel" onPress={() => stopEditing($)} />
@@ -1431,10 +1441,23 @@ async function fit($: EngineInterface) {
   }
 }
 
-async function edit($: EngineInterface, id: number, fn: (task: Task) => Task) {
+/**
+ * Changes task `id` with `fn` while it is open, and resolves the task as the
+ * change found it: one closed meanwhile (Claude withdrew it, or a press from
+ * an older render answered it) or gone (another session took it on) stays
+ * as it is.
+ */
+async function edit($: EngineInterface, id: number, fn: (task: Task) => Task): Promise<Task | undefined> {
   const nowMs = await $.clock.now()
+  let found: Task | undefined
 
-  await change($, list => list.map(task => (task.id === id ? { ...fn(task), updatedMs: nowMs } : task)))
+  await change($, list => {
+    found = list.find(task => task.id === id)
+
+    return found !== undefined && isActive(found) ? list.map(task => (task.id === id ? { ...fn(task), updatedMs: nowMs } : task)) : list
+  })
+
+  return found
 }
 
 /**
@@ -1553,13 +1576,31 @@ async function select($: EngineInterface, id: number) {
   await fit($)
 }
 
-/** The user fulfilled or rejected a task; `how` says when Claude hears of it. */
+/**
+ * The user fulfilled or rejected a task; `how` says when Claude hears of it.
+ * Resolves the task as it stood, as `edit` does: one no longer open stays as it is.
+ */
 async function resolve($: EngineInterface, id: number, patch: Pick<Task, 'state'> & Partial<Task>, how: How) {
-  await edit($, id, task => ({ ...task, ...patch, update: 'pending' }))
+  const was = await edit($, id, task => ({ ...task, ...patch, update: 'pending' }))
   await settle($, id)
 
   if (how === 'now' || (how === 'auto' && !working())) {
     sendSoon($)
+  }
+
+  return was
+}
+
+/**
+ * A press on the pane resolves task `id`, as `resolve` does. One Claude
+ * withdrew, or another session took on, since the pane drew it says so; one
+ * already answered (a second press) stays answered.
+ */
+async function respond($: EngineInterface, id: number, patch: Pick<Task, 'state'> & Partial<Task>, how: How) {
+  const was = await resolve($, id, patch, how)
+
+  if (was === undefined || was.state === 'withdrawn') {
+    $.ui.toast(`Task #${id} isn't open any more, so your response wasn't saved.`)
   }
 }
 
@@ -1576,7 +1617,7 @@ async function answer($: EngineInterface, id: number, text: string, how: How, is
     return
   }
 
-  await resolve($, id, { state: 'done', answer: value }, how)
+  await respond($, id, { state: 'done', answer: value }, how)
 }
 
 async function startEditing($: EngineInterface, id: number, field: Editing['field']) {

@@ -709,9 +709,8 @@ describe('the answer field', () => {
 
     await $.tool.call(XCODE_TASK)
     const ui = await $.ui.mount(inline(60))
+    // The field takes the keys as it opens.
     await ui.press({ key: 'answer' })
-    await $.ui.focus(ringTo('answer-1'))
-    await clock.settle()
     const rows = world.opens.at(-1)?.rows ?? 0
 
     // 45 columns for the text beside `Answer: ` and ` ⏎ send`, one kept for the cursor: three rows.
@@ -730,9 +729,14 @@ describe('the answer field', () => {
     await ui.redraw(inline(60).props)
     expect(world.opens.at(-1)?.rows).toBe(rows + 2)
 
+    // Tab moves the keys on, and Shift+Tab brings them back.
     await $.ui.focus(ringTo('other-way'))
     await clock.settle()
     expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    await $.ui.focus(ringTo('answer-1'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
   })
 
   test('a placeholder longer than the field is cut to its row', async ($, on) => {

@@ -1686,6 +1686,9 @@ async function startEditing($: EngineInterface, id: number, field: Editing['fiel
   const key = fieldKeyOf({ id, field })
 
   live.opened.set(key, live.drafts.get(key) ?? '')
+  // The field takes the ring as it opens: by the move below, or by its
+  // autoFocus, which the engine raises no `ui.focus` for.
+  live.ring = key
   await update($, selectedId, () => id)
   await update($, editing, (): Editing => ({ id, field }))
   await fit($)

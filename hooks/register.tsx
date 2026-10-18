@@ -842,6 +842,9 @@ async function join($: EngineInterface) {
   const sessionId = await $.session.id()
   const root = await $.session.root()
 
+  // A row of the conversation the process leaves is none of this one's.
+  live.isUnread = false
+
   // After /clear the process goes on as a new session, with no slot yet: it
   // takes over once the old session's writes are done, and takes on what
   // the old one held, ended whether or not its end write landed (or, when
@@ -860,6 +863,9 @@ async function join($: EngineInterface) {
       await update($, editing, () => null)
       await update($, loadedFor, () => null)
       live.drafts.clear()
+      live.batch?.cancel()
+      live.batch = null
+      live.isSendingAtEnd = false
       live.elsewhere = 0
       live.floor = 1
       live.hasLegacyPeer = false
@@ -873,11 +879,12 @@ async function join($: EngineInterface) {
     live.endedMs = undefined
 
     return load($)
-  })
-    .catch(() => undefined)
+  }).catch(() => undefined)
+
+  // Tasks from an earlier session: the status line says so, and the pane
+  // opens where the terminal is wide enough to seat it unasked.
+  const shown = joined
     .then(async () => {
-      // Tasks from an earlier session: the status line says so, and the pane
-      // opens where the terminal is wide enough to seat it unasked.
       if (await refresh($)) {
         await show($, false)
       }
@@ -890,6 +897,7 @@ async function join($: EngineInterface) {
   // A store slow to answer holds up the start 5 seconds at most: what the
   // session takes on shows once it answers.
   await awaited($, joined)
+  await redrawn($, shown)
 }
 
 /**
@@ -1006,8 +1014,8 @@ async function beat($: EngineInterface, isWriting = true) {
   }
 
   const was = live.elsewhere
-  const synced = queued(() => sync($, isWriting))
-    .catch((): Synced => 'same')
+  const synced = queued(() => sync($, isWriting)).catch((): Synced => 'same')
+  const shown = synced
     .then(async change => {
       // A first read shows the project as joining does: the pane opens for
       // the tasks it took on.
@@ -1015,8 +1023,10 @@ async function beat($: EngineInterface, isWriting = true) {
         await show($, false)
       }
     })
+    .catch(() => undefined)
 
   await awaited($, synced)
+  await redrawn($, shown)
 }
 
 /**
@@ -1110,31 +1120,44 @@ function queued<T>(work: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Resolves once `work` settles, or `STORE_WAIT_MS` on: a press, a prompt or
- * a tool call goes on without a store that is slow to answer, and the work
- * finishes on its own, in its place in the queue. Until work given up on
- * settles, nothing waits on the store at all.
+ * Resolves once store `work` settles, or `STORE_WAIT_MS` on: a press, a
+ * prompt or a tool call goes on without a store that is slow to answer, and
+ * the work finishes on its own, in its place in the queue. Until work given
+ * up on settles, nothing waits on the store at all.
  */
-function awaited($: EngineInterface, work: Promise<unknown>): Promise<void> {
+async function awaited($: EngineInterface, work: Promise<unknown>) {
   if (live.stalled > 0) {
-    return Promise.resolve()
+    return
   }
 
+  if (!(await within($, work))) {
+    const settled = () => {
+      live.stalled -= 1
+    }
+
+    live.stalled += 1
+    void work.then(settled, settled)
+  }
+}
+
+/**
+ * Resolves once the redraw that store work leads to settles, `STORE_WAIT_MS`
+ * on, or at once while that work was given up on: it is no store work, so a
+ * surface slow to open the pane holds up neither the store nor the heartbeat.
+ */
+async function redrawn($: EngineInterface, shown: Promise<unknown>) {
+  if (live.stalled === 0) {
+    await within($, shown)
+  }
+}
+
+/** Resolves once `work` settles, or `STORE_WAIT_MS` on, whichever is first: whether it settled. */
+function within($: EngineInterface, work: Promise<unknown>): Promise<boolean> {
   return new Promise(resolve => {
-    let isStalled = false
-    const timer = $.clock.after(STORE_WAIT_MS, () => {
-      isStalled = true
-      live.stalled += 1
-      resolve()
-    })
+    const timer = $.clock.after(STORE_WAIT_MS, () => resolve(false))
     const done = () => {
       timer.cancel()
-
-      if (isStalled) {
-        live.stalled -= 1
-      }
-
-      resolve()
+      resolve(true)
     }
 
     void work.then(done, done)

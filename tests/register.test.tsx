@@ -124,6 +124,8 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     isTypedFailing: false,
     /** How long the plugin's own rows take to join the conversation. */
     appendMs: 0,
+    /** How long the surface takes to open a pane. */
+    openMs: 0,
   }
 
   const clock = mock.clock(on, { now: NOW })
@@ -206,7 +208,11 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     world.status = e.text
     return { value: undefined }
   })
-  on('ui.open', ($, e) => {
+  on('ui.open', async ($, e) => {
+    if (world.openMs > 0) {
+      await clock.sleep(world.openMs)
+    }
+
     world.opens.push(e)
     world.isPaneOpen = true
     const isPlaced = e.focus === true || !world.isNarrow
@@ -1881,6 +1887,42 @@ describe('across sessions', () => {
     expect(Object.keys(slotsIn(world.store))).toEqual(['session-1'])
   })
 
+
+  test('a pane slow to open holds up neither the heartbeat nor the store', async ($, on) => {
+    const { world, clock } = seat(on, {
+      [KEYS.session('session-0')]: { tasks: [ROTATE], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 8 },
+    })
+    world.isStoreFailing = true
+    await start($)
+
+    // The heartbeat takes the project on, and the pane it opens takes half a minute.
+    world.isStoreFailing = false
+    world.openMs = 30_000
+    await clock.advance(66_000)
+    world.openMs = 0
+    const reads = world.ops.filter(op => op === 'keys').length
+    await $.tool.call(KEY_TASK)
+
+    // Assigning reads the project first, as it does with no pane opening.
+    expect(world.ops.filter(op => op === 'keys').length).toBe(reads + 1)
+  })
+
+
+  test('a pane slow to open as the session starts holds up neither the heartbeat nor the store', async ($, on) => {
+    const { world, clock } = seat(on, {
+      [KEYS.session('session-0')]: { tasks: [ROTATE], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 8 },
+    })
+    world.openMs = 30_000
+    const started = start($)
+    await clock.advance(6_000)
+    await started
+    world.openMs = 0
+    const reads = world.ops.filter(op => op === 'keys').length
+    await $.tool.call(KEY_TASK)
+
+    expect(world.ops.filter(op => op === 'keys').length).toBe(reads + 1)
+  })
+
   test('after /clear whose end write failed, the session it becomes still takes on the tasks', async ($, on) => {
     const { world, clock } = seat(on)
     await start($)
@@ -2179,6 +2221,29 @@ describe('across sessions', () => {
   })
 
 
+
+  test('a session resumed into another folder as a turn ends wakes Claude for no answer the first one sent', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer', text: 'CartTests.testCouponRounding', kind: 'change' })
+    await ui.press({ key: 'other-way' })
+    await clock.advance(1000)
+    world.sessionId = 'session-3'
+    world.root = '/other'
+    await $.session.end({ reason: 'resume', sessionId: 'session-1', resume: { id: 'session-3' } })
+    await clock.advance(1)
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    expect(world.appended.map(row => row.text)).toContain('Sent your response to #1 to Claude')
+    expect(world.submitted).toEqual([])
+  })
+
   test('a session resumed into another folder selects there as a new session would', async ($, on) => {
     const migration = { ...ROTATE, id: 2, title: 'Approve the staging migration', why: 'It drops a column.' }
     const { world, clock } = seat(on, {
@@ -2205,6 +2270,29 @@ describe('across sessions', () => {
     expect(await textOf(ui, 'task-2')).not.toContain(migration.why)
   })
 
+
+  test('a session resumed into another folder takes on the slot there of the session it left', async ($, on) => {
+    // Session 1 ran in the other folder once, and ended there holding a task.
+    const { world, clock } = seat(on, {
+      [keysOf('/other').session('session-1')]: {
+        tasks: [{ ...ROTATE, sessionId: 'session-1' }],
+        seenMs: NOW - 60_000,
+        endedMs: NOW - 60_000,
+        nextId: 8,
+      },
+    })
+    await start($)
+
+    world.sessionId = 'session-3'
+    world.root = '/other'
+    await $.session.end({ reason: 'resume', sessionId: 'session-1', resume: { id: 'session-3' } })
+    await clock.advance(1)
+    await clock.settle()
+
+    expect(world.status).toBe('☐ 1 task for you · /my-tasks')
+    expect(Object.keys(projectOf('/other', world.store).slots)).toEqual(['session-3'])
+  })
+
   test("a session resumed into another folder changes nothing of 0.1.4's there before it reads that project", async ($, on) => {
     // A 0.1.4 session alive in this folder.
     const { world, clock } = seat(on, { 'tasks:/repo': { nextId: 8, sessions: { 'session-0': { tasks: [ROTATE], seenMs: NOW } }, taken: {} } })
@@ -2223,6 +2311,25 @@ describe('across sessions', () => {
 
     expect(world.ops).toContain('keys')
     expect(Object.keys(world.store)).toEqual(['tasks:/repo'])
+  })
+
+
+  test("after /clear, the session it becomes changes nothing of 0.1.4's before it reads the project", async ($, on) => {
+    // A 0.1.4 session alive in this folder.
+    const { world, clock } = seat(on, { 'tasks:/repo': { nextId: 8, sessions: { 'session-0': { tasks: [ROTATE], seenMs: NOW } }, taken: {} } })
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    const legacy = JSON.parse(JSON.stringify(world.store['tasks:/repo'])) as unknown
+    world.sessionId = 'session-2'
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    // Its reads of the project fail: as it joins, and as it assigns.
+    world.failing = 1
+    await clock.advance(1)
+    world.failing = 1
+    await $.tool.call(XCODE_TASK)
+
+    expect(world.store['tasks:/repo']).toEqual(legacy)
   })
 
   test('a slot that leaves after a month hands its own notes on, so nothing it took is taken twice', async ($, on) => {

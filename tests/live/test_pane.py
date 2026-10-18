@@ -155,6 +155,12 @@ class Pane(unittest.TestCase):
                 self.assertTrue(any(row.startswith('Answer: ') for row in body), context)
                 self.assertIn('Cancel', text, context)
 
+    def test_answer_pressed_with_the_keys_hands_them_to_its_field(self):
+        # Tab onto Answer… and Enter: the keys go to the field, not to the button drawn where Answer… was.
+        body, context = self.draw(TASKS[1:2], 64, keys=('Tab', 'Tab', 'Enter', 'Two failures'))
+
+        self.assertTrue(any(row.startswith('Answer: Two failures') for row in body), context)
+
     def test_a_long_answer_wraps_in_its_field_and_the_pane_grows_to_hold_it(self):
         # Typed after Answer…: the keys go to the field, not to the pane's hotkeys.
         for columns in (36, 64):

@@ -870,12 +870,7 @@ export const register: Register = on => {
           onSubmit={value => answer($, task.id, value, 'auto')}
         />,
         <Box key="buttons" flexDirection="row" flexWrap="wrap" columnGap={BUTTON_GAP}>
-          <Button
-            key="other-way"
-            plain
-            label={otherWay}
-            onPress={() => answer($, task.id, live.drafts.get(key) ?? live.closed.get(key) ?? '', working ? 'now' : 'later')}
-          />
+          <Button key="other-way" plain label={otherWay} onPress={() => answerTyped($, task.id, working ? 'now' : 'later')} />
           <Button key="long" plain label={long} onPress={() => longAnswer($, task.id)} />
           <Button key="cancel" plain label={cancel} onPress={() => stopEditing($)} />
         </Box>,
@@ -1889,11 +1884,29 @@ async function toPromptBox($: EngineInterface, text: string): Promise<boolean> {
   return filled.isFilled
 }
 
+/**
+ * Answers task `id` with what is typed in its field, or, pressed on a
+ * drawing from before the task closed, with what was typed before it did.
+ */
+async function answerTyped($: EngineInterface, id: number, how: How) {
+  const key = fieldKeyOf({ id, field: 'answer' })
+  const draft = live.drafts.get(key)
+  // A closed task's only: a number another session drew too can come back open.
+  const text = draft ?? ((await isOpenNow($, id)) ? '' : (live.closed.get(key) ?? ''))
+
+  return answer($, id, text, how)
+}
+
+/** Whether task `id` is open now: one closed meanwhile, or gone, takes no answer. */
+async function isOpenNow($: EngineInterface, id: number): Promise<boolean> {
+  return (await read($, tasks)).some(task => task.id === id && isActive(task))
+}
+
 async function answer($: EngineInterface, id: number, text: string, how: How, isSecretOk = false) {
   const value = text.trim()
   // Entered or pressed on a drawing from before its task closed, an answer
   // goes to `respond`, which says the task isn't open any more.
-  const isOpen = (await read($, tasks)).some(task => task.id === id && isActive(task))
+  const isOpen = await isOpenNow($, id)
 
   if (isOpen && value === '') {
     $.ui.toast('Type an answer first, or press Cancel.')
@@ -1937,14 +1950,13 @@ async function stopEditing($: EngineInterface) {
 
 /** Moves a long answer into the prompt box, where the real editor takes pastes and lines. */
 async function longAnswer($: EngineInterface, id: number) {
-  const key = fieldKeyOf({ id, field: 'answer' })
-
-  // Pressed on a drawing from before its task closed, it answers as the
-  // button beside it would: the task isn't open any more.
-  if (!(await read($, tasks)).some(task => task.id === id && isActive(task))) {
-    return answer($, id, live.closed.get(key) ?? '', 'later')
+  // Pressed on a drawing from before its task closed, it answers as Save for
+  // later would: the task isn't open any more.
+  if (!(await isOpenNow($, id))) {
+    return answerTyped($, id, 'later')
   }
 
+  const key = fieldKeyOf({ id, field: 'answer' })
   const box = await $.prompt.read()
   const draft = live.drafts.get(key) ?? ''
   const text = bridgeOf(id) + [draft, box.text].filter(part => part.trim() !== '').join('\n')

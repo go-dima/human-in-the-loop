@@ -3142,6 +3142,45 @@ describe('across sessions', () => {
     expect(world.submitted[1]).toContain('#7 Rotate the leaked token in Vault')
   })
 
+  test('a task that comes back after /clear under the number of one Claude withdrew takes nothing typed for that one', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await clock.settle()
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+
+    // Session x drew #1 at the same moment, and ended: the session after /clear takes it on as #1.
+    world.store[KEYS.session('session-x')] = {
+      tasks: [{ ...ROTATE, id: 1, sessionId: 'session-x' }],
+      seenMs: NOW - 60_000,
+      endedMs: NOW - 60_000,
+      nextId: 2,
+    }
+    world.sessionId = 'session-2'
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    await clock.advance(1)
+    await clock.settle()
+
+    expect(slotsIn(world.store)['session-2']?.tasks.map(task => [task.id, task.title])).toEqual([
+      [1, ROTATE.title],
+      [2, ANDROID_TASK.title],
+    ])
+
+    await ui.press({ key: 'select-1' })
+    await ui.press({ key: 'answer' })
+    await ui.press({ key: 'other-way' })
+    await clock.settle()
+
+    expect(world.toasts.at(-1)).toBe('Type an answer first, or press Cancel.')
+    expect(slotsIn(world.store)['session-2']?.tasks.find(task => task.id === 1)?.state).toBe('open')
+    expect(world.composer).toBe('')
+  })
+
   test('a session that ends after /clear before its join has begun ends all the same and takes nothing quiet', async ($, on) => {
     const { world, clock } = seat(on)
     await start($)

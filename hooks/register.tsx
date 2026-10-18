@@ -513,9 +513,18 @@ export const register: Register = on => {
       return { deny: `Task #${found.id} is already ${found.state}; there is nothing to withdraw.` }
     }
 
+    // Its fields go with it: what was typed in them goes to the prompt box,
+    // as for a response the task closed before.
+    const typedText = (['answer', 'reason'] as const)
+      .map(field => (live.drafts.get(fieldKeyOf({ id: found.id, field })) ?? '').trim())
+      .filter(text => text !== '' && !looksSecret(text))
+      .join('\n')
     await settle($, found.id)
+    const isKept = typedText !== '' && (await toPromptBox($, typedText))
     const why = reason === '' ? '' : `. ${printable(reason, 200)}`
-    $.ui.toast(`Claude withdrew the task: ${printable(found.title, MAX_TITLE)}${why}`, { timeoutMs: 8000 })
+    const withdrew = `Claude withdrew the task: ${printable(found.title, MAX_TITLE)}${why}`
+    const kept = isKept ? `${/[.!?]$/.test(withdrew) ? '' : '.'} What you typed is in the prompt box.` : ''
+    $.ui.toast(`${withdrew}${kept}`, { timeoutMs: 8000 })
 
     return { result: `Withdrew task #${found.id}; it is gone from the user's My tasks pane.` }
   })

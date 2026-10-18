@@ -95,6 +95,9 @@ const STORE_WAIT_MS = 5000
 /** What a tool answers while the session moves to another folder, before it has read that folder's tasks. */
 const MOVING = 'This session is still joining its project: the task store is slow to answer. Try again in a moment.'
 
+/** A toast's last words once what was typed for a task that closed is in the prompt box (see `toPromptBox`). */
+const KEPT = 'What you typed is in the prompt box.'
+
 /** The pane the tasks wait in, and the command that opens it. */
 const PANE = 'my-tasks'
 const PANE_TITLE = 'My tasks'
@@ -517,13 +520,13 @@ export const register: Register = on => {
     // as for a response the task closed before.
     const typedText = (['answer', 'reason'] as const)
       .map(field => (live.drafts.get(fieldKeyOf({ id: found.id, field })) ?? '').trim())
-      .filter(text => text !== '' && !looksSecret(text))
+      .filter(text => text !== '')
       .join('\n')
     await settle($, found.id)
-    const isKept = typedText !== '' && (await toPromptBox($, typedText))
+    const isKept = await toPromptBox($, typedText)
     const why = reason === '' ? '' : `. ${printable(reason, 200)}`
     const withdrew = `Claude withdrew the task: ${printable(found.title, MAX_TITLE)}${why}`
-    const kept = isKept ? `${/[.!?]$/.test(withdrew) ? '' : '.'} What you typed is in the prompt box.` : ''
+    const kept = isKept ? `${/[.!?]$/.test(withdrew) ? '' : '.'} ${KEPT}` : ''
     $.ui.toast(`${withdrew}${kept}`, { timeoutMs: 8000 })
 
     return { result: `Withdrew task #${found.id}; it is gone from the user's My tasks pane.` }
@@ -1860,16 +1863,22 @@ async function respond($: EngineInterface, id: number, patch: Pick<Task, 'state'
   const was = await resolve($, id, patch, how)
 
   if (was === undefined || (!isActive(was) && !isRepeatOf(was, patch))) {
-    const isKept = typedText !== '' && !looksSecret(typedText) && (await toPromptBox($, typedText))
+    const kept = (await toPromptBox($, typedText)) ? ` ${KEPT}` : ''
 
-    $.ui.toast(`Task #${id} isn't open any more, so your response wasn't saved.${isKept ? ' What you typed is in the prompt box.' : ''}`, {
-      timeoutMs: 8000,
-    })
+    $.ui.toast(`Task #${id} isn't open any more, so your response wasn't saved.${kept}`, { timeoutMs: 8000 })
   }
 }
 
-/** Puts `text` in the prompt box, on a line after any draft there; resolves whether the box took it. */
+/**
+ * Puts what was typed for a task that closed in the prompt box, on a line
+ * after any draft there, unless it looks like a secret; resolves whether the
+ * box took it.
+ */
 async function toPromptBox($: EngineInterface, text: string): Promise<boolean> {
+  if (text === '' || looksSecret(text)) {
+    return false
+  }
+
   const box = await $.prompt.read()
   const filled = await $.prompt.fill({ text: box.text === '' ? text : `\n${text}`, mode: 'append' }).catch(() => ({ isFilled: false }))
 

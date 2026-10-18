@@ -248,8 +248,8 @@ const live = {
   /** What the user has typed in each field so far, by `fieldKeyOf`. */
   drafts: new Map<string, string>(),
   /**
-   * What was typed for each task that closed, by `fieldKeyOf`: a button
-   * pressed on a drawing from before its task closed answers with it.
+   * What was typed in each answer field as its task closed, by `fieldKeyOf`:
+   * a button pressed on a drawing from before the task closed answers with it.
    */
   closed: new Map<string, string>(),
   /**
@@ -1797,18 +1797,25 @@ async function undelivered($: EngineInterface, ids: readonly number[]) {
   await change($, list => list.map(task => (ids.includes(task.id) && task.update === 'delivered' ? { ...task, update: 'pending' } : task)))
 }
 
-/** Keeps the selection on a task still open, and drops a field whose task is gone. */
+/**
+ * Keeps the selection on a task still open, and drops a field whose task is
+ * gone, keeping what was typed for its answer for a press from a drawing
+ * from before. With nothing typed, it keeps nothing from a close before:
+ * that may have been another task's, under a number another session drew too.
+ */
 async function settle($: EngineInterface, id: number) {
+  const key = fieldKeyOf({ id, field: 'answer' })
+  const draft = live.drafts.get(key)
+
+  if (draft === undefined) {
+    live.closed.delete(key)
+  } else {
+    live.closed.set(key, draft)
+  }
+
   for (const field of ['answer', 'reason'] as const) {
-    const key = fieldKeyOf({ id, field })
-    const draft = live.drafts.get(key)
-
-    forget(key)
-    live.drafts.delete(key)
-
-    if (draft !== undefined) {
-      live.closed.set(key, draft)
-    }
+    forget(fieldKeyOf({ id, field }))
+    live.drafts.delete(fieldKeyOf({ id, field }))
   }
 
   await update($, editing, field => (field?.id === id ? null : field))

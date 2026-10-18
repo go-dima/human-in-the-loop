@@ -3142,8 +3142,9 @@ describe('across sessions', () => {
     expect(world.submitted[1]).toContain('#7 Rotate the leaked token in Vault')
   })
 
-  test('a task that comes back after /clear under the number of one Claude withdrew takes nothing typed for that one', async ($, on) => {
+  test('a task that comes back after /clear under the number of one Claude withdrew takes nothing typed for that one, open or closed', async ($, on) => {
     const { world, clock } = seat(on)
+    const held = holdingPresses(on)
     await start($)
 
     await $.tool.call(XCODE_TASK)
@@ -3178,6 +3179,16 @@ describe('across sessions', () => {
 
     expect(world.toasts.at(-1)).toBe('Type an answer first, or press Cancel.')
     expect(slotsIn(world.store)['session-2']?.tasks.find(task => task.id === 1)?.state).toBe('open')
+    expect(world.composer).toBe('')
+
+    // Withdrawn as Save for later is pressed again, with nothing typed for it.
+    held.isOn = true
+    const pressed = ui.press({ key: 'other-way' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    held.letGo()
+    await pressed
+
+    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved.")
     expect(world.composer).toBe('')
   })
 

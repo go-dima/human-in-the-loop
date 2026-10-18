@@ -516,17 +516,19 @@ export const register: Register = on => {
       return { deny: `Task #${found.id} is already ${found.state}; there is nothing to withdraw.` }
     }
 
-    // Its fields go with it: what was typed in them goes to the prompt box,
+    // Its fields go with it: what was typed in each goes to the prompt box,
     // as for a response the task closed before.
-    const typedText = (['answer', 'reason'] as const)
-      .map(field => (live.drafts.get(fieldKeyOf({ id: found.id, field })) ?? '').trim())
-      .filter(text => text !== '')
-      .join('\n')
+    const typedTexts = (['answer', 'reason'] as const).map(field => (live.drafts.get(fieldKeyOf({ id: found.id, field })) ?? '').trim())
     await settle($, found.id)
-    const isKept = await toPromptBox($, typedText)
+    let isKept = false
+
+    for (const text of typedTexts) {
+      isKept = (await toPromptBox($, text)) || isKept
+    }
+
     const why = reason === '' ? '' : `. ${printable(reason, 200)}`
     const withdrew = `Claude withdrew the task: ${printable(found.title, MAX_TITLE)}${why}`
-    const kept = isKept ? `${/[.!?]$/.test(withdrew) ? '' : '.'} ${KEPT}` : ''
+    const kept = isKept ? `${/[.!?…]$/.test(withdrew) ? '' : '.'} ${KEPT}` : ''
     $.ui.toast(`${withdrew}${kept}`, { timeoutMs: 8000 })
 
     return { result: `Withdrew task #${found.id}; it is gone from the user's My tasks pane.` }

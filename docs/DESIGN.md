@@ -197,6 +197,7 @@ A `prompt.submit` hook recognizes the prefix on Enter, strips it, and records th
 
 - **Claude idle:** the prompt goes through as the message, with the task header added. That is Send now.
 - **Claude working:** the hook answers `{ drop: "Saved as your answer to #5. Claude gets it when this turn ends, or press Send now in /my-tasks." }` ("with your other answers" while another task is open). That is Save for later. The text is kept on the task, so nothing is lost.
+- **The task closed meanwhile** (Claude withdrew it, or it was answered on another surface): the prompt goes through as typed, prefix and all. No toast is needed, since the text still reaches Claude.
 
 This is the design's biggest bet (see the spike). If the terminal `Input` keeps multi-line pastes, the bridge can wait.
 

@@ -1939,6 +1939,20 @@ describe('responding', () => {
 
     expect(world.composer).toBe('LoginTests.testExpiredToken failed')
     expect(world.toasts.at(-1)).toBe('Claude withdrew the task: Run the Android tests on your phone, paste the failures')
+
+    // A secret in one field keeps nothing typed in the other from the prompt
+    // box, and a reason cut short ends the sentence the note follows.
+    await $.tool.call(ANDROID_TASK)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-3', text: KEY_SHAPED, kind: 'change' })
+    await ui.press({ key: 'cancel' })
+    await ui.press({ key: 'reject' })
+    await ui.input({ key: 'reason-3', text: 'Not on this phone', kind: 'change' })
+    await clock.settle()
+    await $.tool.call({ tool: WITHDRAW, id: 3, reason: 'The emulator runs them. '.repeat(10) })
+
+    expect(world.composer).toBe('LoginTests.testExpiredToken failed\nNot on this phone')
+    expect(world.toasts.at(-1)).toMatch(/ runs them\. The emu… What you typed is in the prompt box\.$/)
   })
 
   test("of two presses from one render, the response that lands first stands, and a toast says the other wasn't saved", async ($, on) => {

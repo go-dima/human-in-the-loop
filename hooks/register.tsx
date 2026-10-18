@@ -1530,14 +1530,17 @@ async function refresh($: EngineInterface): Promise<boolean> {
  */
 async function show($: EngineInterface, isAsked: boolean): Promise<boolean> {
   // A closed pane's fields are drawn with their drafts as it opens again:
-  // the surfaces forget what they held as it closes. Asked only when there
-  // is a draft to draw; when the engine can't say, they are drawn so anyway,
-  // and a field still drawn gets back the text typed in it.
+  // the surfaces forget what they held as it closes. Its ring starts on the
+  // open field, which takes it by autoFocus as the pane takes the keys.
+  // Asked only when there is a draft to draw; when the engine can't say,
+  // they are drawn so anyway, and a field still drawn gets back the text
+  // typed in it.
   if (live.drafts.size > 0) {
     const panes = await $.ui.panes().catch(() => undefined)
 
     if (panes === undefined || !panes.some(pane => pane.id === PANE)) {
       live.drawn.clear()
+      live.ring = openKeyOf(await read($, editing))
     }
   }
 
@@ -1638,6 +1641,8 @@ function inlineSeats(): Seat[] {
 
 /** Keeps what the user typed in the field keyed `key`, and the rows it takes. */
 async function typed($: EngineInterface, key: string, value: string) {
+  // Keys typed in a field say the ring is on it, though no move said so.
+  live.ring = key
   live.drafts.set(key, value)
   await refit($)
 }

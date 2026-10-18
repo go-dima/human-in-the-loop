@@ -1223,6 +1223,38 @@ describe('the answer field', () => {
     expect(world.opens.at(-1)?.rows).toBe(rows + 2)
   })
 
+  test('the ring taken by the field unseen, as the pane opens again or a key is typed there, the field asks for the rows its text wraps to', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(60))
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+    await ui.input({
+      key: 'answer-1',
+      text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error',
+      kind: 'change',
+    })
+    await $.ui.focus(ringTo('long'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    // Hidden and opened again, the field's autoFocus takes the ring.
+    await ui.press({ key: 'hide' })
+    await ui.unmount()
+    await runTasks($)
+    const again = await $.ui.mount(inline(60))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+
+    // A key typed in the field says the ring is there.
+    await $.ui.focus(ringTo('long'))
+    await clock.settle()
+    await again.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with rounding', kind: 'change' })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+  })
+
   test('a placeholder longer than the field is cut to its row', async ($, on) => {
     seat(on)
     await start($)

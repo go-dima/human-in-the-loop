@@ -140,6 +140,8 @@ class Claude:
             'endedMs': now_ms - 600_000,
             'nextId': max(task['id'] for task in tasks) + 1,
         }
+        # keysOf keys a root this long by a hash: the seed would sit where no session reads.
+        assert len(f'tasks:{self.project}#session:') + 64 <= 256, f'{self.project} is too long a path for the seeded key'
         path = self.store_file()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # The ended session's slot, under its own key; no session runs yet to write over it.

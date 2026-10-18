@@ -233,6 +233,8 @@ const live = {
   endedMs: undefined as number | undefined,
   /** How many sessions of the process have ended: one that ends before its join comes up in the queue stays ended. */
   ends: 0,
+  /** Updates a prompt entered without, by `updateKeyOf`: given back once, each counts as heard the next time. */
+  reworded: new Set<string>(),
   /** The store work asked for and not yet done: each piece waits for the one before. */
   queue: Promise.resolve() as Promise<unknown>,
   /** Store work a wait gave up on, not settled yet: while there is any, nothing waits on the store. */
@@ -281,6 +283,7 @@ export const register: Register = on => {
     live.heartbeat = null
     live.endedMs = await $.clock.now()
     live.ends += 1
+    const ends = live.ends
 
     // The slot marked ended, in one write and no read, once the store work in
     // flight is done; a session that never read the project reads it first.
@@ -296,7 +299,9 @@ export const register: Register = on => {
     const ended = await next(e)
 
     if (e.reason === 'clear' || e.reason === 'resume') {
-      $.clock.after(0, () => void join($))
+      // With the count as this session ended: the next one, ending before
+      // the join runs, stays ended.
+      $.clock.after(0, () => void join($, ends))
     }
 
     return ended
@@ -330,6 +335,14 @@ export const register: Register = on => {
 
     if ('error' in ask) {
       return { deny: ask.error }
+    }
+
+    // Resumed into another folder, the session takes it on once the store
+    // work in flight is done. A task assigned before then is the old
+    // folder's: the join drops it here, and the old session's end write may
+    // leave it there. A process that never joined a folder has none to leave.
+    if (live.root !== '' && live.root !== (await $.session.root())) {
+      return { deny: 'This session is still joining its project: the task store is slow to answer. Assign the task again in a moment.' }
     }
 
     // Task numbers count per project, across its sessions: the next is past
@@ -843,8 +856,7 @@ async function syncWorking($: EngineInterface) {
  * kept alive by a heartbeat, the status line and, for tasks taken on from an
  * earlier session, the pane.
  */
-async function join($: EngineInterface) {
-  const ends = live.ends
+async function join($: EngineInterface, ends = live.ends) {
   const sessionId = await $.session.id()
   const root = await $.session.root()
 
@@ -1046,8 +1058,10 @@ async function beat($: EngineInterface, isWriting = true) {
  * Reads the project and acts on it: lets go of the tasks another session
  * took on while this one slept, keeps the notes of what this one took that
  * are still needed, counts the tasks waiting elsewhere, and writes the slot,
- * unless not `isWriting` (a write follows) and nothing leaves the store. A
- * session that couldn't read the project as it joined takes it on instead.
+ * unless not `isWriting` (a write follows) and nothing leaves it or the
+ * store: a task let go of leaves at once, since the caller may write nothing
+ * after all (an ask that repeats one, say). A session that couldn't read the
+ * project as it joined takes it on instead.
  * Resolves what changed of what it shows.
  */
 async function sync($: EngineInterface, isWriting = true): Promise<Synced> {
@@ -1075,7 +1089,7 @@ async function sync($: EngineInterface, isWriting = true): Promise<Synced> {
   try {
     // The slot first: it carries the tasks let go of before the note that
     // told of them leaves, and the notes and count of a slot before it does.
-    if (isWriting || pruned.removed.length > 0 || !isEmptyEdit(pruned.legacy)) {
+    if (isWriting || isLost || pruned.removed.length > 0 || !isEmptyEdit(pruned.legacy)) {
       await writeOwn($, pruned.removed.length > 0)
     }
 
@@ -1410,10 +1424,24 @@ async function passOn<R extends PromptSubmitResult>(
     if (result.drop !== undefined) {
       back = { lost: due, note: onDrop, reason: result.drop }
     } else {
+      // A hook beneath that rewords an update's head (masks a secret in its
+      // title, say) leaves it out of every prompt: given back each time, it
+      // would go again as each turn its message starts ends. Given back
+      // once, it counts as heard the next time, and a toast says how.
       const lost = due.filter(task => !isCarried(result, task))
+      const again = lost.filter(task => !live.reworded.has(updateKeyOf(task)))
+      const twice = lost.filter(task => live.reworded.has(updateKeyOf(task)))
 
-      if (lost.length > 0) {
-        back = { lost, note: 'why', reason: 'a hook took it out of the prompt' }
+      lost.forEach(task => live.reworded.add(updateKeyOf(task)))
+
+      if (again.length > 0) {
+        back = { lost: again, note: 'why', reason: 'a hook took it out of the prompt' }
+      }
+
+      if (twice.length > 0) {
+        $.ui.toast(`A hook changed your response to ${numbersOf(twice.map(task => task.id))} again: Claude has it as the hook left it.`, {
+          timeoutMs: 8000,
+        })
       }
     }
 
@@ -1438,6 +1466,11 @@ async function passOn<R extends PromptSubmitResult>(
  */
 function inWords(entered: Entered, task: Task): boolean {
   return entered.text.includes(ownHeadOf(task))
+}
+
+/** The update a task carries, the same through each send and give-back: a new one changes `updatedMs`. */
+function updateKeyOf(task: Task): string {
+  return `${task.id}@${task.updatedMs}`
 }
 
 /** Whether a prompt that entered carries an update in a digest beside its words (`#5 done: <title>.`), read as `inWords` reads them. */

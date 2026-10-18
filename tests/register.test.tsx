@@ -120,6 +120,8 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     isStripping: false,
     /** Set, a hook beneath rewrites the user's typed prompts and their context with it (masks a secret, say). */
     rewriting: undefined as ((text: string) => string) | undefined,
+    /** Set, a hook beneath rewrites every prompt, the plugin's own among them, and their context with it. */
+    masking: undefined as ((text: string) => string) | undefined,
     /** Set, the user's typed prompts fail beneath: nothing there answers them, and the engine rejects them. */
     isTypedFailing: false,
     /** How long the plugin's own rows take to join the conversation. */
@@ -246,14 +248,14 @@ function seat(on: On, store: Record<string, unknown> = {}) {
       return { text: e.text }
     }
 
-    const rewrite = e.origin.kind === 'composer' ? world.rewriting : undefined
+    if (e.origin.kind === 'plugin') {
+      world.submitted.push(e.text)
+    }
+
+    const rewrite = (e.origin.kind === 'composer' ? world.rewriting : undefined) ?? world.masking
 
     if (rewrite !== undefined) {
       return { text: rewrite(e.text), ...(e.context === undefined ? {} : { context: e.context.map(rewrite) }) }
-    }
-
-    if (e.origin.kind === 'plugin') {
-      world.submitted.push(e.text)
     }
 
     return { text: e.text, ...(e.context === undefined ? {} : { context: e.context }) }
@@ -743,6 +745,33 @@ describe('responding', () => {
 
     expect(again.context?.[0]).toContain('#2 done: Pick a pagination strategy for /feed. The user chose: Cursor')
     expect(again.context?.[0]).not.toContain('LoginTests.testExpiredToken failed')
+  })
+
+  test('a response whose head a hook beneath rewords goes back once, and counts as heard the next time: the turns it starts end', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    // A hook beneath masks the key's name in every prompt, the plugin's own among them.
+    world.masking = text => text.replaceAll('STRIPE_SECRET_KEY', '*****')
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'done' })
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(world.submitted).toHaveLength(1)
+    expect(world.toasts.at(-1)).toBe("Claude didn't get your response to #1: a hook took it out of the prompt. It's saved; press Send now in /my-tasks.")
+
+    // The turn that message starts ends, and it goes once more: then Claude has had it twice.
+    for (const turnId of ['t1', 't2', 't3']) {
+      await $.turn.start({ text: '', turnId })
+      await $.turn.complete({ ...DONE, turnId })
+      await clock.settle()
+    }
+
+    expect(world.submitted).toHaveLength(2)
+    expect(world.toasts.at(-1)).toBe('A hook changed your response to #1 again: Claude has it as the hook left it.')
+    expect(world.status).toBeUndefined()
   })
 
   test('a typed prompt that fails beneath keeps its own error, and its answer waits, though the store fails too', async ($, on) => {
@@ -1574,6 +1603,8 @@ describe('across sessions', () => {
     expect(String((again as { result?: unknown }).result)).toContain('Task #1 already asks the user for this')
     expect(world.toasts.at(-1)).toBe('Another session in this project took on task #2 while this one was away. Answer it there.')
     expect(world.status).toBe('☐ 1 task for you · /my-tasks · 1 task in another session')
+    // Nothing was assigned, and the slot no longer holds what was let go.
+    expect(slotsIn(world.store)['session-1']?.tasks.map(task => task.id)).toEqual([1])
   })
 
   test('a heartbeat that lets tasks go redraws, though its write fails', async ($, on) => {
@@ -1840,6 +1871,81 @@ describe('across sessions', () => {
     await cleared
     await clock.settle()
   }
+
+  test('a response given back once counts as heard the next time, and only that response: another task by its number goes back too', async ($, on) => {
+    const done = { ...ROTATE, state: 'done', update: 'pending', answer: 'Rotated.' } as const
+    const { world, clock } = seat(on, {
+      [KEYS.session('session-0')]: { tasks: [{ ...done, updatedMs: 5 }], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 8 },
+    })
+    await start($)
+
+    // A hook beneath masks the vault's name in every prompt.
+    world.masking = text => text.replaceAll('Vault', '*****')
+    const givenBack = () => world.toasts.filter(toast => toast.startsWith("Claude didn't get your response to #7"))
+    await $.prompt.submit(typed('next'))
+    await $.prompt.submit(typed('and the next'))
+
+    expect(givenBack()).toHaveLength(1)
+    expect(world.status).toBeUndefined()
+
+    // Another session's #7, answered there before it ended, comes to the session after /clear.
+    world.store[KEYS.session('session-9')] = {
+      tasks: [{ ...done, sessionId: 'session-9', updatedMs: 9 }],
+      seenMs: NOW - 60_000,
+      endedMs: NOW - 60_000,
+      nextId: 8,
+    }
+    world.sessionId = 'session-2'
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    await clock.advance(1)
+    await clock.settle()
+    await $.prompt.submit(typed('one more'))
+
+    expect(givenBack()).toHaveLength(2)
+  })
+
+  test('a session that ends after /clear before its join has begun ends all the same and takes nothing quiet', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    world.sessionId = 'session-2'
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    // Session 2 ends before the clock runs its join.
+    await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-2', resume: { id: 'session-2' } })
+    world.store[KEYS.session('session-q')] = { tasks: [{ ...ROTATE, sessionId: 'session-q' }], seenMs: NOW - 10 * 60_000, nextId: 8 }
+    await clock.advance(1)
+    await clock.settle()
+
+    expect(slotsIn(world.store)['session-2']?.tasks.map(task => task.id)).toEqual([1])
+    expect(slotsIn(world.store)['session-2']?.endedMs).toBe(NOW)
+  })
+
+  test("Claude can't assign a task while a session resumed into another folder waits to join it", async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    // The heartbeat's read never comes back, and holds up the store work behind it.
+    world.isStuck = true
+    await clock.advance(60_000)
+    world.sessionId = 'session-3'
+    world.root = '/other'
+    const resumed = $.session.end({ reason: 'resume', sessionId: 'session-1', resume: { id: 'session-3' } })
+    await clock.advance(10_000)
+    await resumed
+    await clock.settle()
+    const refused = await $.tool.call(XCODE_TASK)
+
+    expect((refused as { deny?: string }).deny).toContain('still joining its project')
+
+    world.unstick?.()
+    await clock.settle()
+    const assigned = await $.tool.call(XCODE_TASK)
+
+    expect(String((assigned as { result?: unknown }).result)).toContain('Assigned task #1')
+    expect(Object.values(projectOf('/other', world.store).slots).map(slot => slot.tasks.map(task => task.title))).toEqual([[XCODE_TASK.title]])
+  })
 
   test('a session that ends after /clear before it has joined, the store stuck, ends all the same and takes nothing quiet', async ($, on) => {
     const seated = seat(on)

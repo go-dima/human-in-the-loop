@@ -45,7 +45,7 @@ def keep(styled, name):
     os.makedirs(RENDERS, exist_ok=True)
     # Only what a file name and the artifact's upload both take.
     safe = re.sub(r'[^A-Za-z0-9._-]+', '_', name)
-    with open(os.path.join(RENDERS, f'{kept:02d}-{safe}.ansi'), 'w') as f:
+    with open(os.path.join(RENDERS, f'{kept:03d}-{safe}.ansi'), 'w') as f:
         f.write(styled)
 
 

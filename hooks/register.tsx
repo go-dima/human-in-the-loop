@@ -756,6 +756,9 @@ export const register: Register = on => {
     // as the surface's last client left keeps no seat, which nothing there
     // would draw again to take back.
     const isShared = ((await read($, clients))[e.surface]?.length ?? 0) > 1
+    // A surface that docks the pane it seated inline asks for the rows of
+    // those that still seat it inline.
+    const wasInline = (live.seats.get(e.surface) ?? []).some(one => one.isInline)
 
     if (live.emptied.get(e.surface) === emptied) {
       const kept = live.startingOver.delete(e.surface) ? [] : (live.seats.get(e.surface) ?? [])
@@ -769,7 +772,7 @@ export const register: Register = on => {
       return <Text dimColor>No tasks for you right now.</Text>
     }
 
-    if (seat.isInline) {
+    if (seat.isInline || wasInline) {
       const rows = await rowsWanted($, view)
 
       if (rows !== live.rows) {
@@ -1879,7 +1882,16 @@ async function answer($: EngineInterface, id: number, text: string, how: How, is
   const value = text.trim()
 
   if (value === '') {
-    $.ui.toast('Type an answer first, or press Cancel.')
+    // A button pressed on a drawing from before its task closed finds the
+    // draft gone with the task.
+    const isOpen = (await read($, tasks)).some(task => task.id === id && isActive(task))
+
+    if (isOpen) {
+      $.ui.toast('Type an answer first, or press Cancel.')
+    } else {
+      $.ui.toast(`Task #${id} isn't open any more, so your response wasn't saved.`, { timeoutMs: 8000 })
+    }
+
     return
   }
 

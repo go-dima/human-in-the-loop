@@ -1107,6 +1107,8 @@ async function load($: EngineInterface) {
   const count = await read($, nextId)
   let project = stored
   let adoption!: Adoption
+  // Tasks the process didn't hold: their numbers may have named others here.
+  let arrived: Task[] = []
 
   // Taken on against the task list as it stands when it changes hands, so a
   // press meanwhile is kept. `update` runs this again when another write
@@ -1117,10 +1119,12 @@ async function load($: EngineInterface) {
     const done = current.filter(task => task.sessionId === live.sessionId && !isShown(task))
     project = withHeld(stored, holder, slotFrom(current, notes, count, nowMs), nowMs)
     adoption = adopt(project, live.sessionId, nowMs, done.map(task => task.id), live.endedMs !== undefined)
+    arrived = adoption.adopted.filter(task => !current.some(one => isSameTask(one, task)))
 
     return [...done, ...adoption.adopted].sort((a, b) => a.id - b.id)
   })
 
+  await dropNumbers($, arrived.map(task => task.id))
   live.readMs = nowMs
   live.hasSlot ||= live.sessionId in stored.slots
   await update($, nextId, n => Math.max(n, adoption.nextId))
@@ -1139,6 +1143,28 @@ async function load($: EngineInterface) {
     // What it took on stands, and the caller shows it: the next heartbeat
     // makes the writes.
   }
+}
+
+/** Whether `a` and `b` are one task: a number alone can name two, drawn by two sessions at once. */
+function isSameTask(a: Task, b: Task): boolean {
+  return a.id === b.id && a.sessionId === b.sessionId && a.createdMs === b.createdMs
+}
+
+/**
+ * Lets go of what the process keeps under numbers `ids`, which name tasks
+ * it didn't hold (another session drew the number too, or a resumed one
+ * did): the drafts, what was typed as a task under it closed, and a field
+ * open on it. Kept, they would go with the task that holds the number now.
+ */
+async function dropNumbers($: EngineInterface, ids: readonly number[]) {
+  for (const id of ids) {
+    for (const field of ['answer', 'reason'] as const) {
+      live.drafts.delete(fieldKeyOf({ id, field }))
+      live.closed.delete(fieldKeyOf({ id, field }))
+    }
+  }
+
+  await update($, editing, field => (field !== null && ids.includes(field.id) ? null : field))
 }
 
 /**
@@ -1800,16 +1826,13 @@ async function undelivered($: EngineInterface, ids: readonly number[]) {
 /**
  * Keeps the selection on a task still open, and drops a field whose task is
  * gone, keeping what was typed for its answer for a press from a drawing
- * from before. With nothing typed, it keeps nothing from a close before:
- * that may have been another task's, under a number another session drew too.
+ * from before.
  */
 async function settle($: EngineInterface, id: number) {
   const key = fieldKeyOf({ id, field: 'answer' })
   const draft = live.drafts.get(key)
 
-  if (draft === undefined) {
-    live.closed.delete(key)
-  } else {
+  if (draft !== undefined) {
     live.closed.set(key, draft)
   }
 
@@ -1829,6 +1852,12 @@ async function reselect($: EngineInterface) {
 }
 
 async function select($: EngineInterface, id: number) {
+  // Pressed on a drawing from before its task closed, it leaves the pane as
+  // it is: a field open on another task stays open.
+  if (!(await isOpenNow($, id))) {
+    return
+  }
+
   await update($, selectedId, () => id)
   await update($, editing, field => (field?.id === id ? field : null))
   await fit($)
@@ -1897,11 +1926,8 @@ async function toPromptBox($: EngineInterface, text: string): Promise<boolean> {
  */
 async function answerTyped($: EngineInterface, id: number, how: How) {
   const key = fieldKeyOf({ id, field: 'answer' })
-  const draft = live.drafts.get(key)
-  // A closed task's only: a number another session drew too can come back open.
-  const text = draft ?? ((await isOpenNow($, id)) ? '' : (live.closed.get(key) ?? ''))
 
-  return answer($, id, text, how)
+  return answer($, id, live.drafts.get(key) ?? live.closed.get(key) ?? '', how)
 }
 
 /** Whether task `id` is open now: one closed meanwhile, or gone, takes no answer. */

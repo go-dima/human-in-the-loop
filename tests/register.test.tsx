@@ -2017,6 +2017,28 @@ describe('responding', () => {
     expect(world.composer).toBe('LoginTests.testExpiredToken failed')
   })
 
+  test('a title pressed as Claude withdraws its task leaves the field open on another task', async ($, on) => {
+    const { world, clock } = seat(on)
+    const held = holdingPresses(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'select-2' })
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-2', text: 'Pixel 8 passes', kind: 'change' })
+    await clock.settle()
+    held.isOn = true
+    const pressed = ui.press({ key: 'select-1' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    held.letGo()
+    await pressed
+
+    expect(await ui.find({ type: 'Input', key: 'answer-2' })).toBeDefined()
+    expect(world.toasts.at(-1)).toBe('Claude withdrew the task: Run xcodebuild test on your Mac, paste the failures')
+  })
+
   test('Save for later pressed as the same answer lands from the prompt box says nothing, as a second press does', async ($, on) => {
     const { world, clock } = seat(on)
     const held = holdingPresses(on)
@@ -3142,20 +3164,8 @@ describe('across sessions', () => {
     expect(world.submitted[1]).toContain('#7 Rotate the leaked token in Vault')
   })
 
-  test('a task that comes back after /clear under the number of one Claude withdrew takes nothing typed for that one, open or closed', async ($, on) => {
-    const { world, clock } = seat(on)
-    const held = holdingPresses(on)
-    await start($)
-
-    await $.tool.call(XCODE_TASK)
-    await $.tool.call(ANDROID_TASK)
-    const ui = await $.ui.mount(PANE)
-    await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
-    await clock.settle()
-    await $.tool.call({ tool: WITHDRAW, id: 1 })
-
-    // Session x drew #1 at the same moment, and ended: the session after /clear takes it on as #1.
+  /** Session x drew #1 at the same moment as this one, and ended: the session after /clear takes it on as #1. */
+  async function clearTakingOnAnotherOne($: Engine, { world, clock }: ReturnType<typeof seat>) {
     world.store[KEYS.session('session-x')] = {
       tasks: [{ ...ROTATE, id: 1, sessionId: 'session-x' }],
       seenMs: NOW - 60_000,
@@ -3166,6 +3176,22 @@ describe('across sessions', () => {
     await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
     await clock.advance(1)
     await clock.settle()
+  }
+
+  test('a task that comes back after /clear under the number of one Claude withdrew takes nothing typed for that one, open or closed', async ($, on) => {
+    const seated = seat(on)
+    const { world, clock } = seated
+    const held = holdingPresses(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await clock.settle()
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    await clearTakingOnAnotherOne($, seated)
 
     expect(slotsIn(world.store)['session-2']?.tasks.map(task => [task.id, task.title])).toEqual([
       [1, ROTATE.title],
@@ -3190,6 +3216,69 @@ describe('across sessions', () => {
 
     expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved.")
     expect(world.composer).toBe('')
+  })
+
+  test("keys that reach a field as Claude withdraws its task leave nothing for a task back under its number after /clear, and the session's own drafts stay", async ($, on) => {
+    const seated = seat(on)
+    // Held, an input reaches its field once the test lets it go.
+    let isHeld = false
+    let letGo = () => {}
+    on('ui.input', async ($, e, next) => {
+      if (isHeld) {
+        isHeld = false
+        await new Promise<void>(resolve => {
+          letGo = resolve
+        })
+      }
+
+      return next(e)
+    })
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'select-2' })
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-2', text: 'Pixel 8 passes', kind: 'change' })
+    await ui.press({ key: 'select-1' })
+    await ui.press({ key: 'answer' })
+    // A key reaches #1's field as Claude withdraws the task, before the drawing that withdraw wakes.
+    isHeld = true
+    const entered = ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    letGo()
+    await entered
+    await clearTakingOnAnotherOne($, seated)
+    await ui.press({ key: 'select-1' })
+    await ui.press({ key: 'answer' })
+
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('')
+
+    await ui.press({ key: 'select-2' })
+    await ui.press({ key: 'answer' })
+
+    expect((await ui.find({ type: 'Input', key: 'answer-2' }))?.props.value).toBe('Pixel 8 passes')
+  })
+
+  test('Answer… pressed as Claude withdraws its task opens no field on a task back under its number after /clear', async ($, on) => {
+    const seated = seat(on)
+    const held = holdingPresses(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    held.isOn = true
+    const pressed = ui.press({ key: 'answer' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    held.letGo()
+    await pressed
+    await clearTakingOnAnotherOne($, seated)
+
+    // The task back under #1 is the one selected, its buttons drawn.
+    expect(await textOf(ui, 'task-1')).toContain(ROTATE.why)
+    expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
   })
 
   test('a session that ends after /clear before its join has begun ends all the same and takes nothing quiet', async ($, on) => {

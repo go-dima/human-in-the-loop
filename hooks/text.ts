@@ -64,7 +64,7 @@ const JOINING = /[\p{M}\p{Cf}\u1160-\u11FF\uD7B0-\uD7FF]/u
 /**
  * The terminal cells `text` takes, as the engine counts them: two for a
  * wide character, none for a mark on the one before, and two for an emoji
- * however it is built (`☀️`, `1️⃣`, `👍🏽`, `👩‍💻`).
+ * however it is built (`☀️`, `1️⃣`, `1⃣`, `👍🏽`, `👩‍💻`, `❤‍🔥`).
  */
 export function cellsOf(text: string): number {
   let cells = 0
@@ -74,7 +74,14 @@ export function cellsOf(text: string): number {
   let previous = ''
 
   for (const char of text) {
-    if (char === '\uFE0F' && width === 1 && /\p{Emoji}/u.test(base)) {
+    if (char === '\uFE0F' && width === 1 && /\p{Emoji}/u.test(base) && !/[0-9#*]/.test(base)) {
+      // A digit, `#` and `*` widen only in a keycap.
+      width = 2
+    } else if (char === '\u20E3') {
+      // A keycap, whatever it encloses.
+      width = 2
+    } else if (char === '\u200D' && width === 1 && /\p{Extended_Pictographic}/u.test(base) && !/[©®]/.test(base)) {
+      // An emoji drawn as text joining another draws as an emoji (`❤‍🔥`); the engine leaves `©` and `®`, the two below U+0100, as text.
       width = 2
     } else if (/\p{Emoji_Modifier}/u.test(char) && /\p{Emoji_Modifier_Base}/u.test(previous)) {
       width = 2

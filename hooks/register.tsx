@@ -693,17 +693,23 @@ export const register: Register = on => {
 
   // A client gone, the pane fits the ones left, which draw it again as the
   // roster changes: no render says which of its surface's seats was its own,
-  // so they start over.
+  // so they start over, and go with the last client. Both happen ahead of the
+  // write that wakes the drawings, which fit the pane to what is left;
+  // `update` runs this again when another write beat it, and either way the
+  // surface's seats start afresh.
   on('session.detach', async ($, e, next) => {
-    const isLast = ((await read($, clients))[e.surface] ?? []).every(id => id === e.clientId)
+    await update($, clients, all => {
+      const left = (all[e.surface] ?? []).filter(id => id !== e.clientId)
 
-    if (isLast) {
-      live.seats.delete(e.surface)
-    } else {
-      live.startingOver.add(e.surface)
-    }
+      if (left.length > 0) {
+        live.startingOver.add(e.surface)
+      } else {
+        live.seats.delete(e.surface)
+      }
 
-    await update($, clients, all => ({ ...all, [e.surface]: (all[e.surface] ?? []).filter(id => id !== e.clientId) }))
+      return { ...all, [e.surface]: left }
+    })
+
     return next(e)
   })
 
@@ -1586,7 +1592,7 @@ async function fit($: EngineInterface, wanted?: number) {
  * again for: a draft growing, the ring moving onto its field or off it.
  */
 async function refit($: EngineInterface) {
-  if (![...live.seats.values()].flat().some(seat => seat.isInline)) {
+  if (inlineSeats().length === 0) {
     return
   }
 
@@ -1604,10 +1610,15 @@ async function refit($: EngineInterface) {
  * read it, else from the state now.
  */
 async function rowsWanted($: EngineInterface, view?: PaneView): Promise<number> {
-  const inline = [...live.seats.values()].flat().filter(seat => seat.isInline)
+  const inline = inlineSeats()
   const state = view ?? (await paneView($, FIRST_SEAT))
 
   return Math.max(...(inline.length > 0 ? inline : [FIRST_SEAT]).map(seat => rowsFor(seated(state, seat), seat.columns, MAX_PANE_ROWS)))
+}
+
+/** Every way a surface draws the pane inline, where its rows count. */
+function inlineSeats(): Seat[] {
+  return [...live.seats.values()].flat().filter(seat => seat.isInline)
 }
 
 /** Keeps what the user typed in the field keyed `key`, and the rows it takes. */
@@ -1744,8 +1755,10 @@ async function undelivered($: EngineInterface, ids: readonly number[]) {
 /** Keeps the selection on a task still open, and drops a field whose task is gone. */
 async function settle($: EngineInterface, id: number) {
   for (const field of ['answer', 'reason'] as const) {
-    forget(fieldKeyOf({ id, field }))
-    live.drafts.delete(fieldKeyOf({ id, field }))
+    const key = fieldKeyOf({ id, field })
+
+    forget(key)
+    live.drafts.delete(key)
   }
 
   await update($, editing, field => (field?.id === id ? null : field))

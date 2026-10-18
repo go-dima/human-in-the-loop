@@ -197,7 +197,7 @@ class Claude:
                 'if the engine names a --plugin-dir store otherwise now, store_file() must follow'
             ) from error
         self.command('/my-tasks')
-        screen = wait_for(self.session, lambda s: '╰' in s and 'for you' in s)
+        wait_for(self.session, has_pane)
         if keys:
             # The pane takes the keys when the prompt lets it; else ctrl+x tab hands them over.
             try:
@@ -209,7 +209,7 @@ class Claude:
             run('tmux', 'send-keys', '-t', self.session, key)
             time.sleep(0.5)
         # Keys that close the pane and open it again leave it to come back.
-        wait_for(self.session, lambda s: '╰' in s)
+        wait_for(self.session, has_pane)
         time.sleep(1.0)
         return snapshot(self.session, name)
 
@@ -250,6 +250,14 @@ class Claude:
     def close(self):
         self.stop()
         shutil.rmtree(self.home, ignore_errors=True)
+
+
+def has_pane(screen):
+    """Whether the pane is drawn whole: its frame, top to bottom, around its head or a task, which lead with ☐ or ✓ as the status line does not."""
+    try:
+        return any(row.startswith(('☐', '✓')) for row in pane_body(screen))
+    except StopIteration:
+        return False
 
 
 def pane_body(screen):

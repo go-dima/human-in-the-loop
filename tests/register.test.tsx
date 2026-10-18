@@ -475,6 +475,10 @@ describe('long titles', () => {
     expect(cellsOf('☀️ 🌡️ ⚠️')).toBe(8)
     // A keycap, a skin tone, a flag, and emoji joined by U+200D.
     expect(cellsOf('1️⃣ 👍🏽 🇮🇱 👩‍💻 🫱🏼‍🫲🏿')).toBe(14)
+    // Without U+FE0F: a keycap, and an emoji drawn as text joined to another.
+    expect(cellsOf('1⃣ ❤‍🔥 ❤‍🩹')).toBe(8)
+    // A digit, `©` and `®` stay text.
+    expect(cellsOf('9️ ©‍🔥')).toBe(5)
     // Marks and format characters take no cell of their own, nor a Hangul vowel and final spelled apart.
     expect(cellsOf('é​')).toBe(1)
     expect(cellsOf('각')).toBe(2)
@@ -639,6 +643,113 @@ describe('long titles', () => {
     expect(world.opens.at(-1)?.rows).toBe(14)
   })
 
+  test('two clients of one surface leaving at once, the pane fits the surfaces left', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // Both leave together, and the phone reads who is attached late: the tablet still is.
+    await mobile.unmount()
+    world.slowRead = 'clients'
+    world.readMs = 500
+    const leaving = Promise.all([
+      $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' }),
+      $.session.detach({ surface: 'mobile', clientId: 'tablet', reason: 'detach' }),
+    ])
+    await clock.advance(500)
+    await leaving
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
+  test("clients leaving as the roster's write answers late, the pane still fits those left", async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    let lateMs = 0
+    on('state.set', { plugin: 'human-in-the-loop' }, async ($, e, next) => {
+      const set = await next(e)
+
+      if (e.key === 'clients' && lateMs > 0) {
+        await clock.sleep(lateMs)
+      }
+
+      return set
+    })
+    await start($)
+
+    for (const clientId of ['laptop', 'tablet', 'phone']) {
+      await $.session.attach({ surface: 'mobile', clientId })
+    }
+
+    await runTasks($)
+    await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    await mobile.redraw(inline(50).props)
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The pane draws again before the write that wakes it answers: the two
+    // left start their seats over, and once they leave too, the terminal's fit.
+    lateMs = 100
+    const phoneLeaving = $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.advance(100)
+    await phoneLeaving
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(14)
+
+    await mobile.unmount()
+
+    for (const clientId of ['tablet', 'laptop']) {
+      const leaving = $.session.detach({ surface: 'mobile', clientId, reason: 'detach' })
+      await clock.advance(100)
+      await leaving
+    }
+
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
+  test("a client leaving and attaching again as the roster's write answers late keeps the rows it draws", async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    const lateMs: number[] = []
+    on('state.set', { plugin: 'human-in-the-loop' }, async ($, e, next) => {
+      const ms = e.key === 'clients' ? (lateMs.shift() ?? 0) : 0
+      const set = await next(e)
+
+      if (ms > 0) {
+        await clock.sleep(ms)
+      }
+
+      return set
+    })
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    const terminal = await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The phone drops and comes back, drawing the pane, before the write of
+    // its leaving answers: the seat it draws stays.
+    lateMs.push(100)
+    await mobile.unmount()
+    const leaving = $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.settle()
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+    await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    await clock.advance(100)
+    await leaving
+
+    await terminal.redraw(inline(60).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(17)
+  })
+
   test('a client is counted before it first draws the pane', async ($, on) => {
     const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
     await start($)
@@ -739,10 +850,15 @@ describe('long titles', () => {
     await $.tool.call(XCODE_TASK)
     const ui = await $.ui.mount(inline(64))
     await ui.press({ key: 'answer' })
-    // The answer wraps and the pane re-sizes, reading the tasks late: Claude withdraws the task meanwhile.
+    const rows = world.opens.at(-1)?.rows ?? 0
+    await ui.input({ key: 'answer-1', text: 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding', kind: 'change' })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    // The answer, cut short, takes a row less, and the pane re-sizes reading
+    // the tasks late: Claude withdraws the task meanwhile.
     world.slowRead = 'tasks'
     world.readMs = 500
-    const typing = ui.input({ key: 'answer-1', text: 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding', kind: 'change' })
+    const typing = ui.input({ key: 'answer-1', text: 'Two failures', kind: 'change' })
     await clock.advance(1)
     await $.tool.call({ tool: WITHDRAW, id: 1, reason: 'Found them in the CI logs' })
     await clock.advance(500)

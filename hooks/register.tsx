@@ -248,6 +248,11 @@ const live = {
   /** What the user has typed in each field so far, by `fieldKeyOf`. */
   drafts: new Map<string, string>(),
   /**
+   * What was typed for each task that closed, by `fieldKeyOf`: a button
+   * pressed on a drawing from before its task closed answers with it.
+   */
+  closed: new Map<string, string>(),
+  /**
    * What each surface draws each field with, by `fieldKeyOf`: the draft as
    * the surface first drew it. It stays put while the field is typed in, as a
    * value drawn anew puts the field's text back to it, keys typed meanwhile
@@ -869,7 +874,7 @@ export const register: Register = on => {
             key="other-way"
             plain
             label={otherWay}
-            onPress={() => answer($, task.id, live.drafts.get(key) ?? '', working ? 'now' : 'later')}
+            onPress={() => answer($, task.id, live.drafts.get(key) ?? live.closed.get(key) ?? '', working ? 'now' : 'later')}
           />
           <Button key="long" plain label={long} onPress={() => longAnswer($, task.id)} />
           <Button key="cancel" plain label={cancel} onPress={() => stopEditing($)} />
@@ -1031,6 +1036,7 @@ async function join($: EngineInterface, ends = live.ends) {
       await update($, editing, () => null)
       await update($, loadedFor, () => null)
       live.drafts.clear()
+      live.closed.clear()
       live.drawn.clear()
       live.held.clear()
       live.batch?.cancel()
@@ -1800,9 +1806,14 @@ async function undelivered($: EngineInterface, ids: readonly number[]) {
 async function settle($: EngineInterface, id: number) {
   for (const field of ['answer', 'reason'] as const) {
     const key = fieldKeyOf({ id, field })
+    const draft = live.drafts.get(key)
 
     forget(key)
     live.drafts.delete(key)
+
+    if (draft !== undefined) {
+      live.closed.set(key, draft)
+    }
   }
 
   await update($, editing, field => (field?.id === id ? null : field))
@@ -1880,23 +1891,16 @@ async function toPromptBox($: EngineInterface, text: string): Promise<boolean> {
 
 async function answer($: EngineInterface, id: number, text: string, how: How, isSecretOk = false) {
   const value = text.trim()
+  // Entered or pressed on a drawing from before its task closed, an answer
+  // goes to `respond`, which says the task isn't open any more.
+  const isOpen = (await read($, tasks)).some(task => task.id === id && isActive(task))
 
-  if (value === '') {
-    // A button pressed on a drawing from before its task closed finds the
-    // draft gone with the task. One answered meanwhile (a second press, say)
-    // stands as answered, and the press says nothing.
-    const task = (await read($, tasks)).find(one => one.id === id)
-
-    if (task !== undefined && isActive(task)) {
-      $.ui.toast('Type an answer first, or press Cancel.')
-    } else if (task?.state !== 'done') {
-      $.ui.toast(`Task #${id} isn't open any more, so your response wasn't saved.`, { timeoutMs: 8000 })
-    }
-
+  if (isOpen && value === '') {
+    $.ui.toast('Type an answer first, or press Cancel.')
     return
   }
 
-  if (!isSecretOk && looksSecret(value)) {
+  if (isOpen && !isSecretOk && looksSecret(value)) {
     await update($, editing, (): Editing => ({ id, field: 'answer', held: value }))
     return
   }

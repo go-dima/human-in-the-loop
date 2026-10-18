@@ -1199,10 +1199,10 @@ async function beat($: EngineInterface, isWriting = true) {
   const was = live.elsewhere
   const synced = queued(() => sync($, isWriting)).catch((): Synced => 'same')
   const shown = synced
-    .then(async change => {
+    .then(async outcome => {
       // A first read shows the project as joining does: the pane opens for
       // the tasks it took on.
-      if ((change !== 'same' || live.elsewhere !== was) && (await refresh($)) && change === 'joined') {
+      if ((outcome !== 'same' || live.elsewhere !== was) && (await refresh($)) && outcome === 'joined') {
         await show($, false)
       }
     })
@@ -1351,11 +1351,11 @@ async function redrawn($: EngineInterface, shown: Promise<unknown>) {
 
 /** Resolves once `work` settles, or `STORE_WAIT_MS` on, whichever is first: whether it settled. */
 function within($: EngineInterface, work: Promise<unknown>): Promise<boolean> {
-  return new Promise(resolve => {
-    const timer = $.clock.after(STORE_WAIT_MS, () => resolve(false))
+  return new Promise(finish => {
+    const timer = $.clock.after(STORE_WAIT_MS, () => finish(false))
     const done = () => {
       timer.cancel()
-      resolve(true)
+      finish(true)
     }
 
     void work.then(done, done)
@@ -1421,9 +1421,9 @@ function slotFrom(list: readonly Task[], notes: Readonly<Record<string, Took>>, 
 /**
  * Removes the slots this session took over and no longer needs, once its own
  * is written: each of this version's unless it changed since it was read (its
- * session came back), and 0.1.4's by `edit`.
+ * session came back), and 0.1.4's by `legacyEdit`.
  */
-async function clean($: EngineInterface, project: Project, removed: readonly string[], edit: LegacyEdit) {
+async function clean($: EngineInterface, project: Project, removed: readonly string[], legacyEdit: LegacyEdit) {
   const keys = keysOf(live.root)
 
   for (const id of removed) {
@@ -1435,29 +1435,29 @@ async function clean($: EngineInterface, project: Project, removed: readonly str
     }
   }
 
-  await editLegacy($, edit, project.legacy.nextId)
+  await editLegacy($, legacyEdit, project.legacy.nextId)
 }
 
 /**
- * Applies `edit` to 0.1.4's value as it stands just before, its count raised
- * to this session's; with nothing else to change, raises the count alone,
- * while a 0.1.4 session alive here numbers its tasks from it, and only past
- * the count as it was just read (`readCount`). A 0.1.4 session writing in
- * between is the race 0.1.4 always had among its own. A session that hasn't
- * read the project changes nothing there.
+ * Applies `legacyEdit` to 0.1.4's value as it stands just before, its count
+ * raised to this session's; with nothing else to change, raises the count
+ * alone, while a 0.1.4 session alive here numbers its tasks from it, and only
+ * past the count as it was just read (`readCount`). A 0.1.4 session writing
+ * in between is the race 0.1.4 always had among its own. A session that
+ * hasn't read the project changes nothing there.
  */
-async function editLegacy($: EngineInterface, edit: LegacyEdit, readCount = 0) {
+async function editLegacy($: EngineInterface, legacyEdit: LegacyEdit, readCount = 0) {
   const key = keysOf(live.root).legacy
   const count = await read($, nextId)
 
-  if (key === undefined || !(await isLoaded($)) || (isEmptyEdit(edit) && (!live.hasLegacyPeer || count <= readCount))) {
+  if (key === undefined || !(await isLoaded($)) || (isEmptyEdit(legacyEdit) && (!live.hasLegacyPeer || count <= readCount))) {
     return
   }
 
   const current = legacyOf(await $.store.get(key))
-  const edited = editedLegacy(current, edit, count, await $.clock.now())
+  const edited = editedLegacy(current, legacyEdit, count, await $.clock.now())
 
-  if (!isEmptyEdit(edit) || edited.nextId > current.nextId) {
+  if (!isEmptyEdit(legacyEdit) || edited.nextId > current.nextId) {
     await $.store.set(key, edited)
   }
 }

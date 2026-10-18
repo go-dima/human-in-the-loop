@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 
-KEY = 'sk-ant-api00-render-check-not-a-real-key'
+KEY = 'render-check-not-a-real-key'
 
 
 def run(*args, check=True, **kw):

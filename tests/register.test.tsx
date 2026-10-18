@@ -59,6 +59,9 @@ const PAGING_TASK = {
 
 const NOW = 1_000_000
 
+/** Has the shape of a Stripe key, which `looksSecret` holds; built here, so no file carries one. */
+const KEY_SHAPED = `sk_live_${'0'.repeat(24)}`
+
 /** A task an earlier or another session assigned. */
 const ROTATE = {
   id: 7,
@@ -1794,7 +1797,7 @@ describe('responding', () => {
     await $.tool.call(XCODE_TASK)
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer-1', text: 'sk_live_51HxAbCdEfGhIjKlMnOp' })
+    await ui.input({ key: 'answer-1', text: KEY_SHAPED })
     await clock.advance(1000)
     await clock.settle()
 

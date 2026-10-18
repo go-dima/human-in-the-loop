@@ -740,12 +740,50 @@ describe('long titles', () => {
     await mobile.unmount()
     const leaving = $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
     await clock.settle()
-    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+    const attaching = $.session.attach({ surface: 'mobile', clientId: 'phone' })
     await $.ui.mount({ ...inline(32), surface: 'mobile' })
     await clock.advance(100)
-    await leaving
+    await Promise.all([leaving, attaching])
 
     await terminal.redraw(inline(60).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(17)
+  })
+
+  test('a client leaving and attaching again stays counted, though the write of its leaving lands late', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    let lateMs = 0
+    on('state.set', { plugin: 'human-in-the-loop' }, async ($, e, next) => {
+      if (e.key === 'clients' && lateMs > 0) {
+        const ms = lateMs
+        lateMs = 0
+        await clock.sleep(ms)
+      }
+
+      return next(e)
+    })
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The phone drops and attaches again, and the write of its leaving lands
+    // after the engine has it back: it stays counted, so a tablet attaching
+    // next draws as one of two.
+    lateMs = 100
+    await mobile.unmount()
+    const leaving = $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.settle()
+    const attaching = $.session.attach({ surface: 'mobile', clientId: 'phone' })
+    await clock.advance(100)
+    await Promise.all([leaving, attaching])
+
+    const phone = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+    await phone.redraw(inline(60).props)
     await clock.settle()
     expect(world.opens.at(-1)?.rows).toBe(17)
   })

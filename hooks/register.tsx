@@ -205,8 +205,10 @@ const selectedId = atom({ plugin: 'human-in-the-loop', key: 'selectedId' } as co
 const editing = atom({ plugin: 'human-in-the-loop', key: 'editing' } as const, null as Editing | null)
 const loadedFor = atom({ plugin: 'human-in-the-loop', key: 'loadedFor' } as const, null as string | null)
 const isWorking = atom({ plugin: 'human-in-the-loop', key: 'isWorking' } as const, false)
-/** The remote clients attached, by surface (two phones are two clients on one), kept where a reload of the code finds them. */
-const clients = atom({ plugin: 'human-in-the-loop', key: 'clients' } as const, {} as Readonly<Partial<Record<RenderSurface, readonly string[]>>>)
+/** The remote clients attached, by surface: two phones are two clients on one. */
+type Roster = Readonly<Partial<Record<RenderSurface, readonly string[]>>>
+/** The roster, kept where a reload of the code finds it. */
+const clients = atom({ plugin: 'human-in-the-loop', key: 'clients' } as const, {} as Roster)
 
 /**
  * Send now goes to Claude as a message (`auto` while it is idle), Save for
@@ -280,6 +282,8 @@ const live = {
   queue: Promise.resolve() as Promise<unknown>,
   /** Store work a wait gave up on, not settled yet: while there is any, nothing waits on the store. */
   stalled: 0,
+  /** The roster's writes asked for and not yet done: each waits for the one before (see `rostered`). */
+  rosterQueue: Promise.resolve() as Promise<unknown>,
   /**
    * Turns begun and not yet ended. `turn.start` names no loop, so a loop
    * other than main's (an engine side request, a teammate) may begin one that
@@ -687,18 +691,16 @@ export const register: Register = on => {
   // before it draws.
   on('session.attach', async ($, e, next) => {
     live.drawn.delete(e.surface)
-    await update($, clients, all => ({ ...all, [e.surface]: [...new Set(all[e.surface]).add(e.clientId)] }))
+    await rostered($, all => ({ ...all, [e.surface]: [...new Set(all[e.surface]).add(e.clientId)] }))
     return next(e)
   })
 
   // A client gone, the pane fits the ones left, which draw it again as the
   // roster changes: no render says which of its surface's seats was its own,
   // so they start over, and go with the last client. Both happen ahead of the
-  // write that wakes the drawings, which fit the pane to what is left;
-  // `update` runs this again when another write beat it, and either way the
-  // surface's seats start afresh.
+  // write that wakes the drawings, which fit the pane to what is left.
   on('session.detach', async ($, e, next) => {
-    await update($, clients, all => {
+    await rostered($, all => {
       const left = (all[e.surface] ?? []).filter(id => id !== e.clientId)
 
       if (left.length > 0) {
@@ -1287,6 +1289,19 @@ async function letGo($: EngineInterface, project: Project): Promise<boolean> {
 function queued<T>(work: () => Promise<T>): Promise<T> {
   const done = live.queue.then(work, work)
   live.queue = done.catch(() => undefined)
+
+  return done
+}
+
+/**
+ * Writes the roster as `rewrite` has it once the writes asked for before are
+ * done, in the order the engine raised them, so a client that leaves and
+ * attaches again stays counted. Nothing else writes the roster: `rewrite`
+ * runs once, ahead of its write.
+ */
+function rostered($: EngineInterface, rewrite: (all: Roster) => Roster): Promise<Roster> {
+  const done = live.rosterQueue.then(() => update($, clients, rewrite))
+  live.rosterQueue = done.catch(() => undefined)
 
   return done
 }

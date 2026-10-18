@@ -1020,6 +1020,36 @@ describe('responding', () => {
     expect(String((listed as { result?: unknown }).result)).toContain('Two failures')
     expect(world.status).toBe('✓ 1 not sent yet · /my-tasks')
   })
+
+  test('a response that comes in while list_tasks reads is not marked heard: it goes later', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(KEY_TASK)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer', text: 'Two failures' })
+    // list_tasks reads the task list late: Done on #2 lands meanwhile, and
+    // its write of #1 heard reads the list again.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const listed = $.tool.call({ tool: LIST })
+    await clock.advance(1)
+    await ui.press({ key: 'done' })
+    await clock.advance(500)
+    const result = String(((await listed) as { result?: unknown }).result)
+
+    expect(result).toContain('Two failures')
+    expect(result).toContain('#2 open')
+    expect(world.status).toBe('✓ 1 not sent yet · /my-tasks')
+
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#2 Add STRIPE_SECRET_KEY to .env: Done.'])
+  })
 })
 
 describe('long answers in the prompt box', () => {

@@ -236,7 +236,7 @@ const live = {
   endedMs: undefined as number | undefined,
   /** How many sessions of the process have ended: one that ends before its join comes up in the queue stays ended. */
   ends: 0,
-  /** Responses a prompt entered without, by `updateKeyOf`: they go with Send now or the next prompt, not as a turn ends. */
+  /** Responses a prompt entered without, by `updateKeyOf`: they go with Send now, the next prompt or another response, never alone as a turn ends. */
   held: new Set<string>(),
   /** Joins into another folder not done yet: until then the tasks the process holds are the folder's it leaves. */
   moving: 0,
@@ -424,9 +424,10 @@ export const register: Register = on => {
       return { result: `No task #${id}.` }
     }
 
-    // A subagent's read tells the main agent nothing.
+    // A subagent's read tells the main agent nothing. Claude hears the
+    // responses this shows: one that came in after it read goes later.
     if (e.agentId === undefined) {
-      await claim($, task => picked.some(one => one.id === task.id))
+      await claim($, task => picked.some(one => one.id === task.id && one.update === 'pending'))
     }
 
     return { result: listOf(picked, await $.clock.now()) }
@@ -500,7 +501,7 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       // Answers saved while Claude worked go now that it's free, unless a
       // task is still open: then they go with that last answer, together.
-      // One a prompt entered without waits for Send now or the next prompt.
+      // One a prompt entered without goes with them, but sends nothing alone.
       const all = await read($, tasks)
       const isAllAnswered = all.some(task => task.update === 'pending' && !live.held.has(updateKeyOf(task))) && !all.some(isActive)
 

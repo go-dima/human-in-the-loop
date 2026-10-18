@@ -1864,7 +1864,7 @@ async function startEditing($: EngineInterface, id: number, field: Editing['fiel
 
   forget(key)
   // The field takes the ring as it opens: by the move below, or by its
-  // autoFocus, which the engine raises no `ui.focus` for.
+  // autoFocus, whose `ui.focus` reaches none of this plugin's hooks.
   live.ring = key
   await update($, selectedId, () => id)
   await update($, editing, (): Editing => ({ id, field }))

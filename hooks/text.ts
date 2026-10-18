@@ -147,6 +147,11 @@ export function wrapRows(text: string, columns: number): string[] {
       for (const { segment } of GRAPHEMES.segment(word)) {
         const cells = cellsOf(segment)
 
+        // One wider than the row, after a full one, leaves a row empty between them.
+        if (used === width && cells > width) {
+          breakRow()
+        }
+
         if (used + cells > width) {
           breakRow()
         }

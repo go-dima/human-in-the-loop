@@ -491,6 +491,9 @@ describe('long titles', () => {
     expect(wrapRows('Status:☀️', 8)).toEqual(['Status:', '☀️'])
     expect(wrapRows('Pair 👩‍💻👩‍💻👩‍💻👩‍💻', 7)).toEqual(['Pair 👩‍💻', '👩‍💻👩‍💻👩‍💻'])
     expect(wrapRows('नमस्ते', 3)).toEqual(['नम', 'स्ते'])
+    // A row one cell wide: a wide character goes on a row past it, after an empty one where the row before is full.
+    expect(wrapRows('一二', 1)).toEqual(['', '一', '二'])
+    expect(wrapRows('a一', 1)).toEqual(['a', '', '一'])
   })
 
   test('count East Asian wide forms two cells, and the ambiguous ones one', () => {

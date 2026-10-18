@@ -205,6 +205,8 @@ const selectedId = atom({ plugin: 'human-in-the-loop', key: 'selectedId' } as co
 const editing = atom({ plugin: 'human-in-the-loop', key: 'editing' } as const, null as Editing | null)
 const loadedFor = atom({ plugin: 'human-in-the-loop', key: 'loadedFor' } as const, null as string | null)
 const isWorking = atom({ plugin: 'human-in-the-loop', key: 'isWorking' } as const, false)
+/** The remote clients attached, by surface (two phones are two clients on one), kept where a reload of the code finds them. */
+const clients = atom({ plugin: 'human-in-the-loop', key: 'clients' } as const, {} as Readonly<Partial<Record<RenderSurface, readonly string[]>>>)
 
 /**
  * Send now goes to Claude as a message (`auto` while it is idle), Save for
@@ -244,12 +246,13 @@ const live = {
   /** What the user has typed in each field so far, by `fieldKeyOf`. */
   drafts: new Map<string, string>(),
   /**
-   * Each field's draft as it opened, by `fieldKeyOf`: what it is drawn with.
-   * It stays put while the field is typed in, as a value drawn anew puts the
-   * field's text back to it, keys typed meanwhile lost; `reopenFields` brings
-   * it up to the draft as the pane opens again.
+   * What each surface draws each field with, by `fieldKeyOf`: the draft as
+   * the surface first drew it. It stays put while the field is typed in, as a
+   * value drawn anew puts the field's text back to it, keys typed meanwhile
+   * lost. A surface that forgets what its fields hold (the pane closed, or a
+   * client of it came) draws them with the draft again.
    */
-  opened: new Map<string, string>(),
+  drawn: new Map<RenderSurface, Map<string, string>>(),
   batch: null as Timer | null,
   /** Says in the project's store that this session is alive. */
   heartbeat: null as Timer | null,
@@ -291,8 +294,8 @@ const live = {
    * (by `seatsWith`), since a render names no client.
    */
   seats: new Map<RenderSurface, readonly Seat[]>(),
-  /** The remote clients attached, by surface: two phones are two clients on one. */
-  clients: new Map<RenderSurface, Set<string>>(),
+  /** Surfaces a client left while others stay: the next drawing there starts their seats over. */
+  startingOver: new Set<RenderSurface>(),
   /** The key of the element the pane's focus ring last moved onto. */
   ring: undefined as string | undefined,
   /** The rows the pane last asked for. */
@@ -679,22 +682,29 @@ export const register: Register = on => {
     )
   })
 
-  // A second client on a surface (two phones) draws the pane at a width of its own.
+  // A second client on a surface (two phones) draws the pane at a width of
+  // its own, and its fields with what is typed in them so far: it is counted
+  // before it draws.
   on('session.attach', async ($, e, next) => {
-    const attached = await next(e)
-    live.clients.set(e.surface, new Set(live.clients.get(e.surface)).add(e.clientId))
-    return attached
+    live.drawn.delete(e.surface)
+    await update($, clients, all => ({ ...all, [e.surface]: [...new Set(all[e.surface]).add(e.clientId)] }))
+    return next(e)
   })
 
-  // A client gone, the pane fits the ones left: no render says which of its
-  // surface's seats was its own, so they all go, and come back as the
-  // clients left draw the pane again.
+  // A client gone, the pane fits the ones left, which draw it again as the
+  // roster changes: no render says which of its surface's seats was its own,
+  // so they start over.
   on('session.detach', async ($, e, next) => {
-    const left = await next(e)
-    live.clients.get(e.surface)?.delete(e.clientId)
-    live.seats.delete(e.surface)
-    void refit($)
-    return left
+    const isLast = ((await read($, clients))[e.surface] ?? []).every(id => id === e.clientId)
+
+    if (isLast) {
+      live.seats.delete(e.surface)
+    } else {
+      live.startingOver.add(e.surface)
+    }
+
+    await update($, clients, all => ({ ...all, [e.surface]: (all[e.surface] ?? []).filter(id => id !== e.clientId) }))
+    return next(e)
   })
 
   // The ring on the open field lets the terminal wrap what is typed there:
@@ -727,8 +737,9 @@ export const register: Register = on => {
     // Drawn by two clients, a surface keeps how each drew it, or each one's
     // drawing would resize the pane against the other's: as a render names
     // neither, every way it was drawn since a client came or went.
-    const isShared = (live.clients.get(e.surface)?.size ?? 0) > 1
-    live.seats.set(e.surface, isShared ? seatsWith(live.seats.get(e.surface) ?? [], seat) : [seat])
+    const isShared = ((await read($, clients))[e.surface]?.length ?? 0) > 1
+    const kept = live.startingOver.delete(e.surface) ? [] : (live.seats.get(e.surface) ?? [])
+    live.seats.set(e.surface, isShared ? seatsWith(kept, seat) : [seat])
 
     const { shown, editing: field, isWorking: working } = view
 
@@ -737,8 +748,12 @@ export const register: Register = on => {
       return <Text dimColor>No tasks for you right now.</Text>
     }
 
-    if (seat.isInline && (await rowsWanted($, view)) !== live.rows) {
-      void fit($)
+    if (seat.isInline) {
+      const rows = await rowsWanted($, view)
+
+      if (rows !== live.rows) {
+        void fit($, rows)
+      }
     }
 
     const active = shown.filter(isActive)
@@ -819,7 +834,7 @@ export const register: Register = on => {
           key={key}
           label={ANSWER_LABEL}
           placeholder={placeholderOf(answerPlaceholderOf(view), ANSWER_LABEL, submitLabel, columns)}
-          value={live.opened.get(key) ?? ''}
+          value={fieldValueOf(e.surface, key)}
           submitLabel={submitLabel}
           autoFocus
           onInput={value => typed($, key, value)}
@@ -851,13 +866,13 @@ export const register: Register = on => {
           key={key}
           label={REASON_LABEL}
           placeholder={placeholderOf(REASON_PLACEHOLDER, REASON_LABEL, submitLabel, columns)}
-          value={live.opened.get(key) ?? ''}
+          value={fieldValueOf(e.surface, key)}
           submitLabel={submitLabel}
           autoFocus
           onInput={value => typed($, key, value)}
           onSubmit={value => {
             const reason = oneLine(value)
-            return respond($, task.id, { state: 'rejected', ...(reason === '' ? {} : { reason }) }, 'auto')
+            return respond($, task.id, { state: 'rejected', ...(reason === '' ? {} : { reason }) }, 'auto', reason)
           }}
         />,
         <Button key="cancel" plain label="Cancel" onPress={() => stopEditing($)} />,
@@ -992,7 +1007,7 @@ async function join($: EngineInterface, ends = live.ends) {
       await update($, editing, () => null)
       await update($, loadedFor, () => null)
       live.drafts.clear()
-      live.opened.clear()
+      live.drawn.clear()
       live.held.clear()
       live.batch?.cancel()
       live.batch = null
@@ -1493,13 +1508,16 @@ async function refresh($: EngineInterface): Promise<boolean> {
  * surface seated it: one opened unasked waits on a narrow terminal.
  */
 async function show($: EngineInterface, isAsked: boolean): Promise<boolean> {
-  // A closed pane's fields are drawn afresh as it opens again (the surface
-  // forgets what they held as it closes), and none is drawn meanwhile, whose
-  // text a value drawn anew would put back.
-  const panes = await $.ui.panes().catch(() => undefined)
+  // A closed pane's fields are drawn with their drafts as it opens again:
+  // the surfaces forget what they held as it closes. Asked only when there
+  // is a draft to draw; when the engine can't say, they are drawn so anyway,
+  // and a field still drawn gets back the text typed in it.
+  if (live.drafts.size > 0) {
+    const panes = await $.ui.panes().catch(() => undefined)
 
-  if (panes !== undefined && !panes.some(pane => pane.id === PANE)) {
-    reopenFields()
+    if (panes === undefined || !panes.some(pane => pane.id === PANE)) {
+      live.drawn.clear()
+    }
   }
 
   return openAt($, await rowsWanted($), isAsked)
@@ -1551,9 +1569,9 @@ function openKeyOf(field: Editing | null): string | undefined {
   return field === null || field.held !== undefined ? undefined : fieldKeyOf(field)
 }
 
-/** Re-sizes the pane to what it holds now, when it is on screen. */
-async function fit($: EngineInterface) {
-  const rows = await rowsWanted($)
+/** Re-sizes the pane to `wanted` rows, or else to what it holds now, when it is on screen. */
+async function fit($: EngineInterface, wanted?: number) {
+  const rows = wanted ?? (await rowsWanted($))
   // Asked once the rows are known, as the pane re-sizes: one that closed
   // meanwhile, its last task gone, stays closed.
   const panes = await $.ui.panes().catch(() => [])
@@ -1565,12 +1583,17 @@ async function fit($: EngineInterface) {
 
 /**
  * Re-sizes an inline pane whose rows changed with what nothing draws it
- * again for: a draft growing, the ring moving onto its field or off it, a
- * surface leaving.
+ * again for: a draft growing, the ring moving onto its field or off it.
  */
 async function refit($: EngineInterface) {
-  if ([...live.seats.values()].flat().some(seat => seat.isInline) && (await rowsWanted($)) !== live.rows) {
-    await fit($)
+  if (![...live.seats.values()].flat().some(seat => seat.isInline)) {
+    return
+  }
+
+  const rows = await rowsWanted($)
+
+  if (rows !== live.rows) {
+    await fit($, rows)
   }
 }
 
@@ -1591,6 +1614,15 @@ async function rowsWanted($: EngineInterface, view?: PaneView): Promise<number> 
 async function typed($: EngineInterface, key: string, value: string) {
   live.drafts.set(key, value)
   await refit($)
+}
+
+/** What `surface` draws the field keyed `key` with: its draft, as the surface first drew it (see `live.drawn`). */
+function fieldValueOf(surface: RenderSurface, key: string): string {
+  const drawn = live.drawn.get(surface) ?? new Map<string, string>()
+  const value = drawn.get(key) ?? live.drafts.get(key) ?? ''
+
+  live.drawn.set(surface, drawn.set(key, value))
+  return value
 }
 
 /**
@@ -1712,8 +1744,8 @@ async function undelivered($: EngineInterface, ids: readonly number[]) {
 /** Keeps the selection on a task still open, and drops a field whose task is gone. */
 async function settle($: EngineInterface, id: number) {
   for (const field of ['answer', 'reason'] as const) {
+    forget(fieldKeyOf({ id, field }))
     live.drafts.delete(fieldKeyOf({ id, field }))
-    live.opened.delete(fieldKeyOf({ id, field }))
   }
 
   await update($, editing, field => (field?.id === id ? null : field))
@@ -1738,29 +1770,49 @@ async function select($: EngineInterface, id: number) {
  */
 async function resolve($: EngineInterface, id: number, patch: Pick<Task, 'state'> & Partial<Task>, how: How) {
   const was = await edit($, id, task => ({ ...task, ...patch, update: 'pending' }))
+  const isOpen = was !== undefined && isActive(was)
   await settle($, id)
 
-  // One no longer open sends nothing new, and holds back no batch under way.
-  if (was !== undefined && isActive(was) && (how === 'now' || (how === 'auto' && !working()))) {
+  // One no longer open sends nothing new, and holds back no batch under way;
+  // Send now still sends the answer it repeats, saved for later.
+  if ((how === 'now' && (isOpen || isRepeatOf(was, patch))) || (how === 'auto' && isOpen && !working())) {
     sendSoon($)
   }
 
   return was
 }
 
+/** Whether task `was` stands answered as `patch` would answer it: a second press, say. */
+function isRepeatOf(was: Task | undefined, patch: Pick<Task, 'state'> & Partial<Task>): boolean {
+  return was !== undefined && was.state === patch.state && was.answer === patch.answer && was.reason === patch.reason
+}
+
 /**
  * A press on the pane resolves task `id`, as `resolve` does. One Claude
  * withdrew, another session took on, or the user answered otherwise (on
- * another surface, say) since the pane drew it says so; one already answered
- * as this press would answer it (a second press) stays answered.
+ * another surface, say) since the pane drew it says so, and what the user
+ * typed for it (`typedText`) goes to the prompt box, unless it looks like a
+ * secret; one already answered as this press would answer it (a second
+ * press) stays answered.
  */
-async function respond($: EngineInterface, id: number, patch: Pick<Task, 'state'> & Partial<Task>, how: How) {
+async function respond($: EngineInterface, id: number, patch: Pick<Task, 'state'> & Partial<Task>, how: How, typedText = '') {
   const was = await resolve($, id, patch, how)
-  const isRepeat = was !== undefined && was.state === patch.state && was.answer === patch.answer && was.reason === patch.reason
 
-  if (was === undefined || (!isActive(was) && !isRepeat)) {
-    $.ui.toast(`Task #${id} isn't open any more, so your response wasn't saved.`)
+  if (was === undefined || (!isActive(was) && !isRepeatOf(was, patch))) {
+    const isKept = typedText !== '' && !looksSecret(typedText) && (await toPromptBox($, typedText))
+
+    $.ui.toast(`Task #${id} isn't open any more, so your response wasn't saved.${isKept ? ' What you typed is in the prompt box.' : ''}`, {
+      timeoutMs: 8000,
+    })
   }
+}
+
+/** Puts `text` in the prompt box, on a line after any draft there; resolves whether the box took it. */
+async function toPromptBox($: EngineInterface, text: string): Promise<boolean> {
+  const box = await $.prompt.read()
+  const filled = await $.prompt.fill({ text: box.text === '' ? text : `\n${text}`, mode: 'append' }).catch(() => ({ isFilled: false }))
+
+  return filled.isFilled
 }
 
 async function answer($: EngineInterface, id: number, text: string, how: How, isSecretOk = false) {
@@ -1776,13 +1828,13 @@ async function answer($: EngineInterface, id: number, text: string, how: How, is
     return
   }
 
-  await respond($, id, { state: 'done', answer: value }, how)
+  await respond($, id, { state: 'done', answer: value }, how, value)
 }
 
 async function startEditing($: EngineInterface, id: number, field: Editing['field']) {
   const key = fieldKeyOf({ id, field })
 
-  live.opened.set(key, live.drafts.get(key) ?? '')
+  forget(key)
   // The field takes the ring as it opens: by the move below, or by its
   // autoFocus, which the engine raises no `ui.focus` for.
   live.ring = key
@@ -1794,10 +1846,10 @@ async function startEditing($: EngineInterface, id: number, field: Editing['fiel
   void $.ui.focus({ requestId: PANE, key }).then(undefined, () => undefined)
 }
 
-/** Has each field drawn afresh open with what is typed in it so far. */
-function reopenFields() {
-  for (const [key, draft] of live.drafts) {
-    live.opened.set(key, draft)
+/** Has every surface draw the field keyed `key` afresh, with its draft. */
+function forget(key: string) {
+  for (const drawn of live.drawn.values()) {
+    drawn.delete(key)
   }
 }
 

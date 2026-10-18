@@ -72,6 +72,8 @@ declare module 'claude-code' {
       editing: Editing | null
       loadedFor: string | null
       isWorking: boolean
+      /** The remote clients attached, by surface: two phones are two clients on one. */
+      clients: Readonly<Partial<Record<RenderSurface, readonly string[]>>>
     }
   }
 }

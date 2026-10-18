@@ -1915,68 +1915,23 @@ describe('responding', () => {
     expect(world.status).toBe('☐ 1 task for you · /my-tasks')
   })
 
-  test('a task withdrawn as the user types for it leaves what was typed in the prompt box, unless it looks like a secret', async ($, on) => {
+  test('a task withdrawn as the user types for it takes the drafts along, and leaves the prompt box as the user has it', async ($, on) => {
     const { world, clock } = seat(on)
     await start($)
 
     await $.tool.call(XCODE_TASK)
-    await $.tool.call(ANDROID_TASK)
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
     await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
-    await clock.settle()
-    await $.tool.call({ tool: WITHDRAW, id: 1, reason: 'Found it in the CI logs' })
-
-    expect(world.composer).toBe('LoginTests.testExpiredToken failed')
-    expect(world.toasts.at(-1)).toBe(
-      'Claude withdrew the task: Run xcodebuild test on your Mac, paste the failures. Found it in the CI logs. What you typed is in the prompt box.',
-    )
-
-    await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer-2', text: KEY_SHAPED, kind: 'change' })
-    await clock.settle()
-    await $.tool.call({ tool: WITHDRAW, id: 2 })
-
-    expect(world.composer).toBe('LoginTests.testExpiredToken failed')
-    expect(world.toasts.at(-1)).toBe('Claude withdrew the task: Run the Android tests on your phone, paste the failures')
-
-    // A secret in one field keeps nothing typed in the other from the prompt
-    // box, and a reason cut short ends the sentence the note follows.
-    await $.tool.call(ANDROID_TASK)
-    await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer-3', text: KEY_SHAPED, kind: 'change' })
     await ui.press({ key: 'cancel' })
     await ui.press({ key: 'reject' })
-    await ui.input({ key: 'reason-3', text: 'Not on this phone', kind: 'change' })
+    await ui.input({ key: 'reason-1', text: 'Not on this Mac', kind: 'change' })
     await clock.settle()
-    await $.tool.call({ tool: WITHDRAW, id: 3, reason: 'The emulator runs them. '.repeat(10) })
+    world.composer = 'Also bump the version'
+    await $.tool.call({ tool: WITHDRAW, id: 1, reason: 'Found it in the CI logs' })
 
-    expect(world.composer).toBe('LoginTests.testExpiredToken failed\nNot on this phone')
-    expect(world.toasts.at(-1)).toMatch(/ runs them\. The emu… What you typed is in the prompt box\.$/)
-  })
-
-  test('an answer entered as Claude withdraws its task goes to the prompt box once', async ($, on) => {
-    const { world, clock } = seat(on)
-    await start($)
-
-    await $.tool.call(XCODE_TASK)
-    const ui = await $.ui.mount(PANE)
-    await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
-    await clock.settle()
-    // Enter reads the task list late: Claude withdraws #1 meanwhile, and its
-    // draft goes to the prompt box first.
-    world.slowRead = 'tasks'
-    world.readMs = 500
-    const entered = ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
-    await clock.advance(1)
-    await $.tool.call({ tool: WITHDRAW, id: 1 })
-    await clock.advance(500)
-    await entered
-    await clock.settle()
-
-    expect(world.composer).toBe('LoginTests.testExpiredToken failed')
-    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved. What you typed is in the prompt box.")
+    expect(world.composer).toBe('Also bump the version')
+    expect(world.toasts.at(-1)).toBe('Claude withdrew the task: Run xcodebuild test on your Mac, paste the failures. Found it in the CI logs')
   })
 
   test("of two presses from one render, the response that lands first stands, and a toast says the other wasn't saved", async ($, on) => {

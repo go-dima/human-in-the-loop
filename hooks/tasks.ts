@@ -4,7 +4,8 @@ import { ago, oneLine, plural, sizeOf } from './text'
 /** Open tasks at once; the next is refused. */
 export const MAX_OPEN = 5
 export const MAX_TITLE = 80
-const MAX_WHY = 300
+/** The longest why or done-when a task keeps, and the pane draws. */
+export const MAX_WHY = 300
 const MAX_OPTION = 60
 /** Answers longer than this are named in a digest, not quoted. */
 const MAX_INLINE_ANSWER = 2000
@@ -210,19 +211,31 @@ export function assignedOf(task: Task, open: number): string {
  * which this session neither shows nor answers.
  */
 export function statusOf(shown: readonly Task[], elsewhere = 0): string | undefined {
-  const open = shown.filter(isActive).length
-  const saved = shown.length - open
-  const parts = [
-    open > 0 ? `☐ ${plural(open, 'task')} for you` : '',
-    saved > 0 ? `${open > 0 ? '' : '✓ '}${saved} not sent yet` : '',
-  ].filter(part => part !== '')
   const others = elsewhere > 0 ? `${plural(elsewhere, 'task')} in another session` : ''
 
-  if (parts.length === 0) {
+  if (shown.length === 0) {
     return others === '' ? undefined : others
   }
 
-  return [...parts, '/my-tasks', others].filter(part => part !== '').join(' · ')
+  const { glyph, headline, note } = waitingOf(shown)
+
+  return [`${glyph}${headline}${note}`, '/my-tasks', others].filter(part => part !== '').join(' · ')
+}
+
+/**
+ * What waits on the user among `shown`, as the status line and the pane's
+ * head lead with it: `☐ 2 tasks for you · 1 not sent yet`, or `✓ 1 not sent
+ * yet` with no task open, the responses named `noun` where there's room.
+ */
+export function waitingOf(shown: readonly Task[], noun?: string): { glyph: string; headline: string; note: string } {
+  const open = shown.filter(isActive).length
+  const saved = shown.length - open
+
+  return {
+    glyph: open > 0 ? '☐ ' : '✓ ',
+    headline: open > 0 ? `${plural(open, 'task')} for you` : `${noun === undefined ? saved : plural(saved, noun)} not sent yet`,
+    note: open > 0 && saved > 0 ? ` · ${saved} not sent yet` : '',
+  }
 }
 
 const BRIDGE = /^\s*↳?\s*Answer to #(\d+):[ \t]*\n?/i

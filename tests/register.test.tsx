@@ -364,6 +364,18 @@ describe('assigning', () => {
     expect((sixth as { deny?: string }).deny).toContain('already has 5 open tasks')
   })
 
+  test("the tools stay in the prompt's list, where the engine puts an MCP tool behind ToolSearch", async ($, on) => {
+    seat(on)
+    on('tool.describe', ($, e) => ({ description: e.description, isDeferred: true }))
+    await start($)
+
+    for (const tool of [ASSIGN, LIST, WITHDRAW]) {
+      const described = await $.tool.describe({ tool, description: 'From the server.', isDeferred: true, provider: { plugin: 'human-in-the-loop', tier: 'user' } })
+
+      expect(described).toEqual({ description: 'From the server.', isDeferred: false })
+    }
+  })
+
   test('a subagent cannot assign tasks', async ($, on) => {
     seat(on)
     await start($)
@@ -832,6 +844,8 @@ describe('responding', () => {
     expect(world.submitted).toHaveLength(0)
     expect(world.appended).toHaveLength(0)
     expect(await textOf(ui, 'saved-1')).toContain('not sent yet')
+    // The pane has the room to say what is not sent; the status line says it short.
+    expect(await textOf(ui, 'head')).toContain('✓ 1 response not sent yet')
     expect(world.status).toBe('✓ 1 not sent yet · /my-tasks')
 
     await $.turn.complete({ ...DONE, turnId: 't1' })
@@ -1059,6 +1073,22 @@ describe('responding', () => {
     const next = await $.prompt.submit(typed('now the cart'))
 
     expect(next.context?.[0]).toContain('LoginTests.testExpiredToken failed')
+  })
+
+  test("of two saved responses, the first row's Send now answers s and the other a click", async ($, on) => {
+    seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(PAGING_TASK)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Two failures' })
+    await ui.press({ key: 'option-1' })
+
+    expect((await ui.find({ type: 'Button', key: 'send-1' }))?.props.hotkey).toBe('s')
+    expect((await ui.find({ type: 'Button', key: 'send-2' }))?.props.hotkey).toBeUndefined()
   })
 
   test('Send now while Claude works reaches it in the turn', async ($, on) => {

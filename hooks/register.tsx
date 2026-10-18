@@ -42,6 +42,7 @@ import {
   rowsFor,
   savedOf,
   selectedOf,
+  sendNowOf,
   submitLabelOf,
   titleOf,
   whyOf,
@@ -341,9 +342,9 @@ export const register: Register = on => {
   // The tools stay in the prompt's list, descriptions and all, where an MCP
   // tool would wait behind ToolSearch: the description is what steers Claude
   // to assign a task, so the ask stays in front of the user.
-  on('tool.describe', { tool: 'mcp__human-in-the-loop__assign_task' }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
-  on('tool.describe', { tool: 'mcp__human-in-the-loop__list_tasks' }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
-  on('tool.describe', { tool: 'mcp__human-in-the-loop__withdraw_task' }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
+  on('tool.describe', { tool: ASSIGN }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
+  on('tool.describe', { tool: LIST }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
+  on('tool.describe', { tool: WITHDRAW }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
 
   on('tool.call', { tool: ASSIGN }, async ($, e) => {
     if (e.agentId !== undefined) {
@@ -645,7 +646,7 @@ export const register: Register = on => {
       return next(e)
     }
 
-    const { Box, Text } = $.ui.resolve(e)
+    const { Text } = $.ui.resolve(e)
 
     return (
       // One text, so the label keeps its words whole and the title wraps after it.
@@ -896,7 +897,7 @@ export const register: Register = on => {
           {savedOf(task)}
         </Text>
         <Box flexShrink={0} marginLeft={2}>
-          <Button key={`send-${task.id}`} plain {...(i === 0 ? { hotkey: 's' } : {})} label="Send now" onPress={() => sendNow($)} />
+          <Button key={`send-${task.id}`} plain {...sendNowOf(i)} onPress={() => sendNow($)} />
         </Box>
       </Box>
     ))

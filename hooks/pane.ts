@@ -1,6 +1,6 @@
 import type { Editing, Task } from '../types'
-import { isActive } from './tasks'
-import { ago, cellsOf, clip, plural, printable, rowsOf } from './text'
+import { MAX_WHY, isActive, waitingOf } from './tasks'
+import { ago, cellsOf, clip, printable, rowsOf } from './text'
 
 /**
  * The longest title the pane and the transcript draw. `assign_task` takes
@@ -45,15 +45,9 @@ export function selectedOf(view: PaneView): Task | undefined {
   return active.find(task => task.id === view.selectedId) ?? active[0]
 }
 
+/** The pane's head: `☐ 2 tasks for you · 1 not sent yet`, or `✓ 1 response not sent yet`. */
 export function headlineOf(view: PaneView): { glyph: string; headline: string; note: string } {
-  const active = view.shown.filter(isActive).length
-  const saved = view.shown.length - active
-
-  return {
-    glyph: active > 0 ? '☐ ' : '✓ ',
-    headline: active > 0 ? `${plural(active, 'task')} for you` : `${plural(saved, 'response')} not sent yet`,
-    note: active > 0 && saved > 0 ? ` · ${saved} not sent yet` : '',
-  }
+  return waitingOf(view.shown, 'response')
 }
 
 /** A task's whole title, safe to draw. */
@@ -74,11 +68,11 @@ export function ageOf(task: Task, view: Pick<PaneView, 'nowMs' | 'sessionId'>): 
 }
 
 export function whyOf(task: Task): string {
-  return printable(task.why, 300)
+  return printable(task.why, MAX_WHY)
 }
 
 export function doneWhenOf(task: Task): string | undefined {
-  return task.doneWhen === undefined ? undefined : `Done when: ${printable(task.doneWhen, 300)}`
+  return task.doneWhen === undefined ? undefined : `Done when: ${printable(task.doneWhen, MAX_WHY)}`
 }
 
 /** A saved response's row: its task, and that it waits. */
@@ -168,9 +162,16 @@ export function fieldRowsOf(label: string, submitLabel: string, text: string, is
   return text.split('\n').reduce((rows, line) => rows + rowsOf(line, width), 0)
 }
 
-/** The first saved row's Send now answers `s`. */
+/** The `i`th saved row's Send now: the first answers `s`. */
+export function sendNowOf(i: number): { hotkey?: string; label: string } {
+  return i === 0 ? { hotkey: 's', label: 'Send now' } : { label: 'Send now' }
+}
+
+/** The `i`th saved row's Send now as the terminal draws it: `s: Send now` on the first. */
 export function sendLabelOf(i: number): string {
-  return i === 0 ? 's: Send now' : 'Send now'
+  const { hotkey, label } = sendNowOf(i)
+
+  return hotkey === undefined ? label : `${hotkey}: ${label}`
 }
 
 export function hintOf(view: PaneView): string {

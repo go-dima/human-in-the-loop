@@ -4,7 +4,8 @@ Run with `python3 tests/live/test_pane.py` from the repository's root, with
 `claude` and `tmux` on the PATH. Each case seeds tasks an ended session left,
 opens /my-tasks in a terminal of the given size and reads the screen back:
 every title shows whole, nothing is cut off at the pane's bottom, and the
-pane asks for no rows it leaves empty.
+pane asks for no rows it leaves empty. With RENDERS_DIR set, each screen a
+test reads is kept there, and `tests/live/renders.py` lays them out.
 """
 
 import os
@@ -50,6 +51,12 @@ SAVED = [
     {'id': 5, 'title': LONG, 'why': 'It leaked.', 'state': 'done', 'update': 'pending'},
 ]
 
+# Emoji the terminal draws two cells wide, below U+1F300 too: the title wraps at 100 columns.
+EMOJI = 'Tag issues ✅ done, ❌ failed, ⏳ waiting, ⚡ urgent, ⛔ blocked'
+
+# An answer longer than its field's row, with a word longer than the row too.
+DRAFT = 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding'
+
 
 def flat(text):
     """Text as one line: the pane's wrapping and the frame's padding gone."""
@@ -66,7 +73,9 @@ class Pane(unittest.TestCase):
         claude = Claude(ROOT)
         try:
             claude.seed(tasks)
-            screen = claude.pane(columns, HEIGHT, keys)
+            # Text typed goes by `typed` in the name, a key by its own.
+            name = '-'.join([self._testMethodName, str(columns), *('typed' if ' ' in key else key for key in keys)])
+            screen = claude.pane(columns, HEIGHT, keys, name=name)
         finally:
             claude.close()
         body = pane_body(screen)
@@ -127,6 +136,14 @@ class Pane(unittest.TestCase):
                     self.assertTrue(row.startswith('  ') and not row.startswith('   '), 'a title row out of line\n' + context)
                 self.assertIn('3m · from an earlier session', joined(title_rows), context)
 
+    def test_emoji_take_the_cells_the_terminal_draws_them_in(self):
+        for columns in (36, 100):
+            with self.subTest(columns=columns):
+                body, context = self.draw([{'id': 7, 'title': EMOJI, 'why': 'The ⌛ build waits on it.', 'kind': 'answer'}], columns)
+
+                self.assert_fits(body, context)
+                self.assertIn(f'#7 {EMOJI} 3m · from an earlier session', joined(body), context)
+
     def test_saved_responses_and_titles_past_80_characters_show_whole(self):
         for columns in (48, 64):
             with self.subTest(columns=columns):
@@ -145,8 +162,42 @@ class Pane(unittest.TestCase):
                 text = joined(body)
 
                 self.assert_fits(body, context)
-                self.assertIn('Answer ›', text, context)
+                # Across the body's whole width, which the terminal sizes a field by.
+                self.assertTrue(any(row.startswith('Answer: ') for row in body), context)
                 self.assertIn('Cancel', text, context)
+
+    def test_answer_pressed_with_the_keys_hands_them_to_its_field(self):
+        # Tab onto Answer… and Enter: the keys go to the field, not to the button drawn where Answer… was.
+        body, context = self.draw(TASKS[1:2], 64, keys=('Tab', 'Tab', 'Enter', 'Two failures'))
+
+        self.assertTrue(any(row.startswith('Answer: Two failures') for row in body), context)
+
+    def test_a_long_answer_wraps_in_its_field_and_the_pane_grows_to_hold_it(self):
+        # Typed after Answer…: the keys go to the field, not to the pane's hotkeys.
+        for columns in (36, 64):
+            with self.subTest(columns=columns):
+                body, context = self.draw(TASKS[1:2], columns, keys=('r', DRAFT))
+
+                self.assert_fits(body, context)
+                # Whole, wrapped beside the label, the hint after its first row.
+                self.assertIn(DRAFT.replace(' ', ''), joined(body).replace('⏎ send', '').replace(' ', ''), context)
+                self.assertIn('Cancel', joined(body), context)
+
+    def test_closed_and_opened_again_the_field_holds_what_was_typed_in_it(self):
+        # ctrl+x x closes the pane as the person's close key does, and the
+        # terminal forgets the field's text; /my-tasks opens it again.
+        body, context = self.draw(TASKS[1:2], 64, keys=('r', DRAFT, 'C-x', 'x', '/my-tasks', 'Enter'))
+
+        self.assertIn(DRAFT.replace(' ', ''), joined(body).replace('⏎ send', '').replace(' ', ''), context)
+
+    def test_a_long_answer_out_of_the_keys_keeps_the_pane_fitted(self):
+        # Tab moves the keys on: the field draws one row of its text, the label squeezed onto a second.
+        for columns in (36, 64):
+            with self.subTest(columns=columns):
+                body, context = self.draw(TASKS[1:2], columns, keys=('r', DRAFT, 'Tab'))
+
+                self.assert_fits(body, context)
+                self.assertIn('Cancel', joined(body), context)
 
 
 class TranscriptRow(unittest.TestCase):
@@ -155,7 +206,8 @@ class TranscriptRow(unittest.TestCase):
             with self.subTest(columns=columns):
                 claude = Claude(ROOT)
                 try:
-                    screen = claude.transcript(columns, 40, {'title': XCODE, 'why': "I can't run Xcode here.", 'kind': 'answer'})
+                    tool_input = {'title': XCODE, 'why': "I can't run Xcode here.", 'kind': 'answer'}
+                    screen = claude.transcript(columns, 40, tool_input, name=f'{self._testMethodName}-{columns}')
                 finally:
                     claude.close()
                 lines = screen.split('\n')

@@ -2,7 +2,7 @@ import type { On, PaneOpenArgs, PromptSubmitInput } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 
-import { rowsFor } from '../hooks/pane'
+import { fieldRowsOf, rowsFor } from '../hooks/pane'
 import { keysOf, projectOf } from '../hooks/project'
 import { cellsOf, rowsOf, wrapRows } from '../hooks/text'
 
@@ -131,6 +131,16 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     appendMs: 0,
     /** How long the surface takes to open a pane. */
     openMs: 0,
+    /** How long the surface takes to say which panes are open: it says so as they were when asked. */
+    panesMs: 0,
+    /** How long the engine takes to attach a client once the plugin's hooks have seen it. */
+    attachMs: 0,
+    /** Set, the engine can't list the plugin's panes. */
+    isPanesFailing: false,
+    /** How many times the plugin asked which of its panes are open. */
+    panesAsked: 0,
+    /** How many times the plugin read its task list. */
+    tasksRead: 0,
   }
 
   const clock = mock.clock(on, { now: NOW })
@@ -188,6 +198,7 @@ function seat(on: On, store: Record<string, unknown> = {}) {
 
   on('state.get', { plugin: 'human-in-the-loop' }, async ($, e, next) => {
     const read = await next(e)
+    world.tasksRead += e.key === 'tasks' ? 1 : 0
 
     if (e.key === world.slowRead && world.fastReads > 0) {
       world.fastReads -= 1
@@ -201,6 +212,14 @@ function seat(on: On, store: Record<string, unknown> = {}) {
 
   on('session.id', () => ({ value: world.sessionId }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('session.attach', async ($, e) => {
+    if (world.attachMs > 0) {
+      await clock.sleep(world.attachMs)
+    }
+
+    return { clientId: e.clientId }
+  })
+  on('session.detach', ($, e) => ({ clientId: e.clientId }))
   on('session.root', () => ({ value: world.root }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__human-in-the-loop__${e.name}` } }))
@@ -227,9 +246,21 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     world.isPaneOpen = false
     return { value: undefined }
   })
-  on('ui.panes', () => ({
-    value: world.isPaneOpen ? [{ id: 'my-tasks', title: 'My tasks', isShown: true, isFocused: true, isPlaced: !world.isNarrow }] : [],
-  }))
+  on('ui.panes', async () => {
+    world.panesAsked += 1
+
+    if (world.isPanesFailing) {
+      return { deny: 'The surface is busy.' }
+    }
+
+    const value = world.isPaneOpen ? [{ id: 'my-tasks', title: 'My tasks', isShown: true, isFocused: true, isPlaced: !world.isNarrow }] : []
+
+    if (world.panesMs > 0) {
+      await clock.sleep(world.panesMs)
+    }
+
+    return { value }
+  })
   on('ui.focus', () => ({}))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
@@ -286,8 +317,8 @@ function seat(on: On, store: Record<string, unknown> = {}) {
   })
   on('prompt.read', () => ({ value: { text: world.composer, cursor: world.composer.length } }))
   on('prompt.fill', ($, e) => {
-    world.composer = e.text
-    return { isFilled: true, text: e.text, cursor: e.text.length }
+    world.composer = e.mode === 'append' ? world.composer + e.text : e.text
+    return { isFilled: true, text: world.composer, cursor: world.composer.length }
   })
 
   return { world, clock }
@@ -308,6 +339,27 @@ async function runTasks($: Engine) {
     origin: { kind: 'composer' },
     presentation: { isFullscreen: true, columns: 160 },
   })
+}
+
+/**
+ * Set, holds the next press short of its button until `letGo`: a press from
+ * a drawing a write has changed since, before the drawing it wakes lands.
+ */
+function holdingPresses(on: On) {
+  const held = { isOn: false, letGo: () => {} }
+
+  on('ui.press', async ($, e, next) => {
+    if (held.isOn) {
+      held.isOn = false
+      await new Promise<void>(resolve => {
+        held.letGo = resolve
+      })
+    }
+
+    return next(e)
+  })
+
+  return held
 }
 
 type Drawn = Pick<Mounted<'terminal', 'Pane'>, 'find'>
@@ -361,6 +413,18 @@ describe('assigning', () => {
 
     const sixth = await $.tool.call({ ...KEY_TASK, title: 'One task too many' })
     expect((sixth as { deny?: string }).deny).toContain('already has 5 open tasks')
+  })
+
+  test("the tools stay in the prompt's list, where the engine puts an MCP tool behind ToolSearch", async ($, on) => {
+    seat(on)
+    on('tool.describe', ($, e) => ({ description: e.description, isDeferred: true }))
+    await start($)
+
+    for (const tool of [ASSIGN, LIST, WITHDRAW]) {
+      const described = await $.tool.describe({ tool, description: 'From the server.', isDeferred: true, provider: { plugin: 'human-in-the-loop', tier: 'user' } })
+
+      expect(described).toEqual({ description: 'From the server.', isDeferred: false })
+    }
   })
 
   test('a subagent cannot assign tasks', async ($, on) => {
@@ -435,6 +499,40 @@ describe('long titles', () => {
     expect(rowsOf('ステージング環境のデータベース移行を承認してください', 30)).toBe(2)
   })
 
+  test('count an emoji as the terminal draws it: two cells, however it is built', () => {
+    // Drawn as emoji by default, below U+1F300 too.
+    expect(cellsOf('⌛ ✅ ⚡ ⭐ 🀄 🈯')).toBe(17)
+    // An emoji drawn as text unless U+FE0F asks otherwise.
+    expect(cellsOf('☀ 🌡')).toBe(3)
+    expect(cellsOf('☀️ 🌡️ ⚠️')).toBe(8)
+    // A keycap, a skin tone, a flag, and emoji joined by U+200D.
+    expect(cellsOf('1️⃣ 👍🏽 🇮🇱 👩‍💻 🫱🏼‍🫲🏿')).toBe(14)
+    // Without U+FE0F: a keycap, and an emoji drawn as text joined to another.
+    expect(cellsOf('1⃣ ❤‍🔥 ❤‍🩹')).toBe(8)
+    // A digit, `©` and `®` stay text.
+    expect(cellsOf('9️ ©‍🔥')).toBe(5)
+    // Marks and format characters take no cell of their own, nor a Hangul vowel and final spelled apart.
+    expect(cellsOf('é​')).toBe(1)
+    expect(cellsOf('각')).toBe(2)
+    expect(rowsOf('Fix the ⏳ timeouts ✅ before the ⛔ freeze', 20)).toBe(3)
+  })
+
+  test('break a word wider than the row between the characters the terminal draws, never inside one', () => {
+    // A skin tone stays on its hand, U+FE0F on its sun, emoji joined by U+200D together, and a conjunct with its vowel sign.
+    expect(wrapRows('👍🏽👍🏽👍🏽👍🏽👍🏽', 9)).toEqual(['👍🏽👍🏽👍🏽👍🏽', '👍🏽'])
+    expect(wrapRows('Status:☀️', 8)).toEqual(['Status:', '☀️'])
+    expect(wrapRows('Pair 👩‍💻👩‍💻👩‍💻👩‍💻', 7)).toEqual(['Pair 👩‍💻', '👩‍💻👩‍💻👩‍💻'])
+    expect(wrapRows('नमस्ते', 3)).toEqual(['नम', 'स्ते'])
+    // A row one cell wide: a wide character goes on a row past it, after an empty one where the row before is full.
+    expect(wrapRows('一二', 1)).toEqual(['', '一', '二'])
+    expect(wrapRows('a一', 1)).toEqual(['a', '', '一'])
+  })
+
+  test('count East Asian wide forms two cells, and the ambiguous ones one', () => {
+    expect(cellsOf('〈☰⚊䷀ꥠ︐﹐\u{16FE0}\u{17000}\u{1B000}\u{1D300}\u{1F200}')).toBe(24)
+    expect(cellsOf('㉈')).toBe(1)
+  })
+
   test('the pane asks for a row for each row a wrapped title takes, at the width it is drawn in', () => {
     const view = {
       shown: [INSTRUMENTS, XCODE_LONG],
@@ -446,6 +544,7 @@ describe('long titles', () => {
       isWorking: false,
       canType: true,
       isFocused: true,
+      isTyping: false,
     }
 
     // A title on one row would ask for 10 rows wherever it is drawn: the
@@ -468,6 +567,460 @@ describe('long titles', () => {
     // The terminal narrows: the titles take more rows, and the pane asks for them.
     await ui.redraw(inline(32).props)
     expect(world.opens.at(-1)?.rows).toBe(18)
+  })
+
+  test('drawn on two surfaces at once, the pane asks for the rows the narrower takes, and keeps them', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    const terminal = await $.ui.mount(inline(60))
+    const phone = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // Each draws again: the pane asks for nothing new.
+    const opens = world.opens.length
+    await terminal.redraw(inline(60).props)
+    await phone.redraw(inline(32).props)
+    expect(world.opens.length).toBe(opens)
+
+    // The phone leaves: the pane fits the terminal.
+    await phone.unmount()
+    await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
+  test('a surface that docks the pane it drew inline leaves it as tall as the surfaces still drawing it inline', async ($, on) => {
+    const { world } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    const terminal = await $.ui.mount(inline(32))
+    await $.ui.mount({ ...inline(60), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(18)
+
+    // The terminal widens and docks the pane: the phone's rows are the pane's.
+    await terminal.redraw(PANE.props)
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
+  test('drawn by two clients of one surface, the pane asks for the rows the narrower takes, and keeps them', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    // A render names its surface, not its client: the tablet's and the phone's come as one surface's.
+    await runTasks($)
+    const mobile = await $.ui.mount({ ...inline(60), surface: 'mobile' })
+    await mobile.redraw(inline(32).props)
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // Each draws again: the pane asks for nothing new.
+    const opens = world.opens.length
+    await mobile.redraw(inline(60).props)
+    await mobile.redraw(inline(32).props)
+    expect(world.opens.length).toBe(opens)
+
+    // The phone leaves: the tablet drawing again, the pane fits it, and
+    // follows it as it widens.
+    await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await mobile.redraw(inline(60).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+
+    await mobile.redraw(inline(100).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(11)
+  })
+
+  test("of two clients of one surface, one drawing it otherwise again and again keeps the other's rows", async ($, on) => {
+    const { world } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+
+    await runTasks($)
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    // The tablet takes the keys and gives them back, turned one way and the other.
+    for (const [columns, isFocused] of [[60, false], [60, true], [90, false], [90, true]] as const) {
+      await mobile.redraw({ ...inline(columns).props, isFocused })
+    }
+
+    expect(world.opens.at(-1)?.rows).toBe(17)
+  })
+
+  test('a client of two leaving, the pane asks for none of the rows it took', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(60), surface: 'mobile' })
+    await mobile.redraw(inline(32).props)
+    await mobile.redraw(inline(60).props)
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The phone leaves, and the tablet draws the pane again: the pane fits it and the terminal.
+    await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
+  test('a client of three leaving, the two left draw the pane again, and it fits them', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+
+    for (const clientId of ['phone', 'tablet', 'laptop']) {
+      await $.session.attach({ surface: 'mobile', clientId })
+    }
+
+    await runTasks($)
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    await mobile.redraw(inline(60).props)
+    await mobile.redraw(inline(50).props)
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The phone leaves. No surface seats the pane inline but theirs, and the
+    // narrower of the two drew last.
+    await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(14)
+  })
+
+  test('two clients of one surface leaving at once, the pane fits the surfaces left', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // Both leave together, and the phone reads who is attached late: the tablet still is.
+    await mobile.unmount()
+    world.slowRead = 'clients'
+    world.readMs = 500
+    const leaving = Promise.all([
+      $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' }),
+      $.session.detach({ surface: 'mobile', clientId: 'tablet', reason: 'detach' }),
+    ])
+    await clock.advance(500)
+    await leaving
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
+  test("clients leaving as the roster's write answers late, the pane still fits those left", async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    let lateMs = 0
+    on('state.set', { plugin: 'human-in-the-loop' }, async ($, e, next) => {
+      const set = await next(e)
+
+      if (e.key === 'clients' && lateMs > 0) {
+        await clock.sleep(lateMs)
+      }
+
+      return set
+    })
+    await start($)
+
+    for (const clientId of ['laptop', 'tablet', 'phone']) {
+      await $.session.attach({ surface: 'mobile', clientId })
+    }
+
+    await runTasks($)
+    await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    await mobile.redraw(inline(50).props)
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The pane draws again before the write that wakes it answers: the two
+    // left start their seats over, and once they leave too, the terminal's fit.
+    lateMs = 100
+    const phoneLeaving = $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.advance(100)
+    await phoneLeaving
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(14)
+
+    await mobile.unmount()
+
+    for (const clientId of ['tablet', 'laptop']) {
+      const leaving = $.session.detach({ surface: 'mobile', clientId, reason: 'detach' })
+      await clock.advance(100)
+      await leaving
+    }
+
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
+  test("a client leaving and attaching again as the roster's write answers late keeps the rows it draws", async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    const lateMs: number[] = []
+    on('state.set', { plugin: 'human-in-the-loop' }, async ($, e, next) => {
+      const ms = e.key === 'clients' ? (lateMs.shift() ?? 0) : 0
+      const set = await next(e)
+
+      if (ms > 0) {
+        await clock.sleep(ms)
+      }
+
+      return set
+    })
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    const terminal = await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The phone drops and comes back, drawing the pane, before the write of
+    // its leaving answers: the seat it draws stays.
+    lateMs.push(100)
+    await mobile.unmount()
+    const leaving = $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.settle()
+    const attaching = $.session.attach({ surface: 'mobile', clientId: 'phone' })
+    await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    await clock.advance(100)
+    await Promise.all([leaving, attaching])
+
+    await terminal.redraw(inline(60).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(17)
+  })
+
+  test('a client leaving and attaching again stays counted, though the write of its leaving lands late', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    let lateMs = 0
+    on('state.set', { plugin: 'human-in-the-loop' }, async ($, e, next) => {
+      if (e.key === 'clients' && lateMs > 0) {
+        const ms = lateMs
+        lateMs = 0
+        await clock.sleep(ms)
+      }
+
+      return next(e)
+    })
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The phone drops and attaches again, and the write of its leaving lands
+    // after the engine has it back: it stays counted, so a tablet attaching
+    // next draws as one of two.
+    lateMs = 100
+    await mobile.unmount()
+    const leaving = $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.settle()
+    const attaching = $.session.attach({ surface: 'mobile', clientId: 'phone' })
+    await clock.advance(100)
+    await Promise.all([leaving, attaching])
+
+    const phone = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+    await phone.redraw(inline(60).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(17)
+  })
+
+  test('the last client of a surface leaving as it draws the pane, the pane asks for none of the rows that drawing takes', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    const terminal = await $.ui.mount(inline(60))
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The phone draws the pane again and leaves before that drawing reads who is attached.
+    world.slowRead = 'clients'
+    world.readMs = 100
+    const drawing = mobile.redraw(inline(32).props)
+    await clock.settle()
+    await mobile.unmount()
+    await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+    await clock.advance(100)
+    await drawing.catch(() => undefined)
+
+    await terminal.redraw(inline(60).props)
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
+  test('a client is counted before it first draws the pane', async ($, on) => {
+    const { world, clock } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+
+    await runTasks($)
+    const mobile = await $.ui.mount({ ...inline(32), surface: 'mobile' })
+    expect(world.opens.at(-1)?.rows).toBe(17)
+
+    // The tablet draws as it attaches, before the engine is done attaching it.
+    world.attachMs = 500
+    const attached = $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+    await clock.advance(1)
+    await mobile.redraw(inline(60).props)
+    await clock.advance(500)
+    await attached
+    await clock.settle()
+
+    expect(world.opens.at(-1)?.rows).toBe(17)
+  })
+
+  test("the clients attached are kept in the session's state, which a reload of the code keeps", async ($, on) => {
+    seat(on)
+    let roster: unknown
+    on('state.set', { plugin: 'human-in-the-loop' }, ($, e, next) => {
+      roster = e.key === 'clients' ? e.value : roster
+      return next(e)
+    })
+    await start($)
+
+    await $.session.attach({ surface: 'mobile', clientId: 'phone' })
+    await $.session.attach({ surface: 'mobile', clientId: 'tablet' })
+    await $.session.attach({ surface: 'desktop', clientId: 'laptop' })
+    await $.session.detach({ surface: 'mobile', clientId: 'phone', reason: 'detach' })
+
+    expect(roster).toEqual({ mobile: ['tablet'], desktop: ['laptop'] })
+  })
+
+  test('re-sizing the pane, a drawing or a keystroke reads the tasks once', async ($, on) => {
+    const { world } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+
+    await runTasks($)
+    const ui = await $.ui.mount(inline(60))
+    world.tasksRead = 0
+    await ui.redraw(inline(32).props)
+    expect(world.opens.at(-1)?.rows).toBe(18)
+    expect(world.tasksRead).toBe(1)
+
+    await ui.redraw(inline(100).props)
+    await ui.press({ key: 'select-2' })
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+    world.tasksRead = 0
+    await ui.input({
+      key: 'answer-2',
+      text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error in the total',
+      kind: 'change',
+    })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+    expect(world.tasksRead).toBe(1)
+  })
+
+  test('docked beside the transcript, the terminal asks for no rows of its own', async ($, on) => {
+    const { world } = seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
+    await start($)
+
+    await runTasks($)
+    await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 32 } })
+    await $.ui.mount({ ...inline(60), surface: 'mobile' })
+
+    expect(world.opens.at(-1)?.rows).toBe(12)
+  })
+
+  test('the last task leaving, the pane closes and asks for no rows as it goes', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    const ui = await $.ui.mount(inline(60))
+    const opens = world.opens.length
+    // Drawn empty while the withdraw writes the store, before the pane closes.
+    world.setMs = 1000
+    const withdrawn = $.tool.call({ tool: WITHDRAW, id: 1 })
+    await clock.advance(1)
+    await ui.redraw(inline(60).props)
+    await clock.advance(1000)
+    await withdrawn
+
+    expect(world.opens.length).toBe(opens)
+    expect(world.isPaneOpen).toBe(false)
+  })
+
+  test('re-sizing as its last task leaves, the pane stays closed', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(64))
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+    await ui.input({ key: 'answer-1', text: 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding', kind: 'change' })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    // The answer, cut short, takes a row less, and the pane re-sizes reading
+    // the tasks late: Claude withdraws the task meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const typing = ui.input({ key: 'answer-1', text: 'Two failures', kind: 'change' })
+    await clock.advance(1)
+    await $.tool.call({ tool: WITHDRAW, id: 1, reason: 'Found them in the CI logs' })
+    await clock.advance(500)
+    await typing
+    await clock.settle()
+
+    expect(world.isPaneOpen).toBe(false)
+  })
+
+  test('a re-size the surface answers late, as Claude withdraws the last task, leaves the pane closed', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(64))
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+
+    // The answer takes a row more, and the surface says late, as it was when
+    // asked, that the pane is open: Claude withdraws the task meanwhile.
+    world.panesMs = 500
+    const typing = ui.input({ key: 'answer-1', text: 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding', kind: 'change' })
+    await clock.advance(1)
+    await $.tool.call({ tool: WITHDRAW, id: 1, reason: 'Found them in the CI logs' })
+    await clock.advance(500)
+    await typing
+    await clock.settle()
+
+    expect(world.isPaneOpen).toBe(false)
+    expect(world.opens.at(-1)?.rows).toBe(rows)
+  })
+
+  test('a re-size the surface answers late, as the pane is hidden, leaves it hidden', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(64))
+    await ui.press({ key: 'answer' })
+
+    world.panesMs = 500
+    const typing = ui.input({ key: 'answer-1', text: 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding', kind: 'change' })
+    await clock.advance(1)
+    await ui.press({ key: 'hide' })
+    await clock.advance(500)
+    await typing
+    await clock.settle()
+
+    expect(world.isPaneOpen).toBe(false)
   })
 
   test('every open task shows its whole title, wrapping, with its age after it in the same text', async ($, on) => {
@@ -495,6 +1048,75 @@ describe('long titles', () => {
     expect(title.length).toBeGreaterThan(80)
     expect(await textOf(ui, 'task-1')).toContain(title)
     expect(await textOf(ui, 'saved-2')).toContain(`#2 ${title} · not sent yet`)
+  })
+
+  test('a focused field wraps its text a column short of the field, for the cursor', () => {
+    // 60 across: `Answer: ` and ` ⏎ send` leave the field 45 columns, its text 44.
+    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(44), true, 60)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(45), true, 60)).toBe(2)
+    // Out of the keys, the text is cut to one row, and the label, cut short, wraps onto a second:
+    // as Claude Code 2.1.296 drew 56 and 57 characters at 64 columns.
+    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(56), false, 60)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(57), false, 60)).toBe(2)
+    // However narrow the pane, the terminal gives the field 12 columns, its text 11.
+    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(22), true, 20)).toBe(2)
+    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(23), true, 20)).toBe(3)
+  })
+
+  test('a row too narrow for the label, the field and the hint takes its lack from each, and what is cut short wraps onto a second', () => {
+    // As Claude Code 2.1.296 drew them at 30, 29 and 28 columns: bodies 26, 25 and 24 across.
+    // The placeholder takes the field's 12 columns, the text its cells and the cursor's: a row a cell short cuts only the field.
+    expect(fieldRowsOf('Answer', 'send', '', true, 26)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', '', true, 25)).toBe(2)
+    expect(fieldRowsOf('Reason', 'reject', '', true, 26)).toBe(2)
+    expect(fieldRowsOf('Answer', 'send', 'abc', true, 24)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', 'abcdefghij', true, 25)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', 'abcdefghijk', true, 26)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', 'abcdefghijk', true, 25)).toBe(2)
+    // Out of the keys, the placeholder cut to the field, at 23 and 22 columns.
+    expect(fieldRowsOf('Answer', 'send', '', false, 19)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', '', false, 18)).toBe(2)
+  })
+
+  test('a field squeezed onto a second row in a narrow pane asks for that row', async ($, on) => {
+    const { world, clock } = seat(on, earlier([{ ...XCODE_LONG, title: 'Paste the failures', why: "I can't run Xcode." }]))
+    await start($)
+
+    await runTasks($)
+    // At 28 columns Claude Code 2.1.296 squeezes `⏎ send` under the empty field: 13 rows in all.
+    const ui = await $.ui.mount(inline(24))
+    await ui.press({ key: 'answer' })
+    expect(world.opens.at(-1)?.rows).toBe(13)
+
+    // A short answer leaves the hint room on its row.
+    await ui.input({ key: 'answer-2', text: 'abc', kind: 'change' })
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+
+    await ui.input({ key: 'answer-2', text: 'abcdefghijk', kind: 'change' })
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(13)
+  })
+
+  test('an empty field in a narrow pane, hidden and opened again, takes the ring and asks for the row it squeezes onto', async ($, on) => {
+    const { world, clock } = seat(on, earlier([{ ...XCODE_LONG, title: 'Paste the failures', why: "I can't run Xcode." }]))
+    await start($)
+
+    await runTasks($)
+    const ui = await $.ui.mount(inline(24))
+    await ui.press({ key: 'answer' })
+    // Out of the keys, the field draws no hint: one row.
+    await $.ui.focus(ringTo('long'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+
+    // Hidden and opened again, the field's autoFocus takes the ring, and `⏎ send` squeezes under it.
+    await ui.press({ key: 'hide' })
+    await ui.unmount()
+    await runTasks($)
+    await $.ui.mount(inline(24))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(13)
   })
 
   test('the transcript row keeps its label whole and wraps the title after it', async ($, on) => {
@@ -536,6 +1158,37 @@ describe('the pane and /my-tasks', () => {
     expect(world.opens.at(-1)?.focus).toBe(true)
   })
 
+  test('the phone, which draws no field, offers Done and a Reject that rejects at once', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
+
+    expect((await phone.findAll({ type: 'Button' })).map(button => button.props.label)).toEqual(['Done', 'Reject', 'Hide'])
+
+    await phone.press({ key: 'reject' })
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(world.submitted).toEqual([
+      "My response to a task you gave me (Human in the loop):\n\n#1 Run xcodebuild test on your Mac, paste the failures: I won't do this.",
+    ])
+  })
+
+  test('a field open on a surface that draws one leaves the task its buttons on the phone', async ($, on) => {
+    seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
+
+    expect(await ui.find({ type: 'Input' })).toBeDefined()
+    expect((await phone.findAll({ type: 'Button' })).map(button => button.props.label)).toEqual(['Done', 'Reject', 'Hide'])
+  })
+
   test('Hide closes the pane and the status line keeps the count', async ($, on) => {
     const { world } = seat(on)
     await start($)
@@ -546,6 +1199,293 @@ describe('the pane and /my-tasks', () => {
 
     expect(world.isPaneOpen).toBe(false)
     expect(world.status).toBe('☐ 1 task for you · /my-tasks')
+  })
+})
+
+/** A second task that takes an answer, as XCODE_TASK does. */
+const ANDROID_TASK = { ...XCODE_TASK, title: 'Run the Android tests on your phone, paste the failures' } as const
+
+/** The pane's focus ring moving onto `element`, as the person's click or Tab moves it. */
+function ringTo(element: string) {
+  return {
+    component: 'Pane',
+    requestId: 'my-tasks',
+    plugin: 'human-in-the-loop',
+    element,
+    origin: { kind: 'person' },
+  } as const
+}
+
+describe('the answer field', () => {
+  test("Answer… opens a field of the task's own, labelled for the terminal to add its colon", async ($, on) => {
+    seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.label).toBe('Answer')
+  })
+
+  test("a draft stays with its task: another task's field opens empty, and the first keeps its own", async ($, on) => {
+    seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await ui.press({ key: 'select-2' })
+    await ui.press({ key: 'answer' })
+
+    expect((await ui.find({ type: 'Input', key: 'answer-2' }))?.props.value).toBe('')
+
+    await ui.press({ key: 'select-1' })
+    await ui.press({ key: 'answer' })
+
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('LoginTests.testExpiredToken failed')
+  })
+
+  test('a held answer comes back to its field on Edit', async ($, on) => {
+    seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: KEY_SHAPED, kind: 'change' })
+    await ui.input({ key: 'answer-1', text: KEY_SHAPED })
+    await ui.press({ key: 'edit' })
+
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe(KEY_SHAPED)
+  })
+
+  test('typed in, the field keeps the value it opened with: one drawn anew puts its text back, keys typed since lost', async ($, on) => {
+    seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests', kind: 'change' })
+    // The pane draws again while the user types: Claude assigns another task.
+    await $.tool.call(ANDROID_TASK)
+
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('')
+  })
+
+  test('hidden and opened again, the field holds what was typed in it', async ($, on) => {
+    const { clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Use the staging creds', kind: 'change' })
+    await clock.settle()
+    await ui.press({ key: 'hide' })
+    await ui.unmount()
+    await runTasks($)
+    const again = await $.ui.mount(PANE)
+
+    expect((await again.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('Use the staging creds')
+  })
+
+  test("hidden and opened again while the engine can't list its panes, the field holds what was typed in it", async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Use the staging creds', kind: 'change' })
+    await clock.settle()
+    await ui.press({ key: 'hide' })
+    await ui.unmount()
+    world.isPanesFailing = true
+    await runTasks($)
+    const again = await $.ui.mount(PANE)
+
+    expect((await again.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('Use the staging creds')
+  })
+
+  test('with no draft to draw again, the pane opens without asking which panes are open', async ($, on) => {
+    const { world } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await runTasks($)
+
+    expect(world.opens).toHaveLength(2)
+    expect(world.panesAsked).toBe(0)
+  })
+
+  test('a client attaching draws the field with what is typed in it, and leaves a field drawn elsewhere the value it opened with', async ($, on) => {
+    const { clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Use the staging creds', kind: 'change' })
+    await clock.settle()
+    await $.session.attach({ surface: 'desktop', clientId: 'laptop' })
+    const laptop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    // The pane draws again: Claude assigns another task.
+    await $.tool.call(ANDROID_TASK)
+
+    expect((await laptop.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('Use the staging creds')
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('')
+  })
+
+  test('a second client of a surface draws the field with what is typed in it', async ($, on) => {
+    const { clock } = seat(on)
+    await start($)
+    await $.session.attach({ surface: 'desktop', clientId: 'laptop' })
+
+    await $.tool.call(XCODE_TASK)
+    const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    await desktop.press({ key: 'answer' })
+    await desktop.input({ key: 'answer-1', text: 'Use the staging creds', kind: 'change' })
+    await clock.settle()
+    // The desktop app opens on another computer, and draws the pane.
+    await $.session.attach({ surface: 'desktop', clientId: 'office' })
+    await desktop.redraw()
+
+    expect((await desktop.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('Use the staging creds')
+  })
+
+  test('typed in, the field asks for the rows its text wraps to, and for one row less once the keys leave it', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(60))
+    // The field takes the keys as it opens.
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+
+    // 45 columns for the text beside `Answer: ` and ` ⏎ send`, one kept for the cursor: three rows.
+    await ui.input({
+      key: 'answer-1',
+      text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error',
+      kind: 'change',
+    })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+
+    // Out of the keys, the text is cut to one row; the label, squeezed, wraps onto a second.
+    await ui.redraw({ ...inline(60).props, isFocused: false })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    // Back in them, the ring is where it was.
+    await ui.redraw(inline(60).props)
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+
+    // Tab moves the keys on, and Shift+Tab brings them back.
+    await $.ui.focus(ringTo('other-way'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    await $.ui.focus(ringTo('answer-1'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+  })
+
+  test('the ring taken by the field unseen, as the pane opens again or a key is typed there, the field asks for the rows its text wraps to', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(60))
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+    await ui.input({
+      key: 'answer-1',
+      text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error',
+      kind: 'change',
+    })
+    await $.ui.focus(ringTo('long'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    // Hidden and opened again, the field's autoFocus takes the ring.
+    await ui.press({ key: 'hide' })
+    await ui.unmount()
+    await runTasks($)
+    const again = await $.ui.mount(inline(60))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+
+    // A key typed in the field says the ring is there.
+    await $.ui.focus(ringTo('long'))
+    await clock.settle()
+    await again.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with rounding', kind: 'change' })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+  })
+
+  test('opened again, a field takes the ring and asks for the rows its draft wraps to', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(60))
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+    await ui.input({
+      key: 'answer-1',
+      text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error',
+      kind: 'change',
+    })
+    await $.ui.focus(ringTo('other-way'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    await ui.press({ key: 'cancel' })
+    await ui.press({ key: 'answer' })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+  })
+
+  test('a key typed as a move of the ring re-sizes the pane, the pane asks for the rows the key leaves', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(60))
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed', kind: 'change' })
+    expect(world.opens.at(-1)?.rows).toBe(rows + 1)
+
+    // Tab moves the keys on, and that re-size reads slowly once it has the
+    // draft; the person comes back to the field and types meanwhile.
+    world.slowRead = 'isWorking'
+    world.readMs = 100
+    await $.ui.focus(ringTo('other-way'))
+    await clock.settle()
+    const typing = ui.input({
+      key: 'answer-1',
+      text: 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error',
+      kind: 'change',
+    })
+    await clock.settle()
+    await clock.advance(100)
+    await typing
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows + 2)
+  })
+
+  test('a placeholder longer than the field is cut to its row', async ($, on) => {
+    seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(32))
+    await ui.press({ key: 'answer' })
+
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.placeholder).toBe('Enter sends it t…')
   })
 })
 
@@ -575,14 +1515,16 @@ describe('responding', () => {
     const ui = await $.ui.mount(PANE)
 
     await ui.press({ key: 'answer' })
-    expect((await ui.find({ type: 'Input', key: 'answer' }))?.props.placeholder).toBe('Enter saves it; Claude gets it when this turn ends')
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.placeholder).toBe('Enter saves it; Claude gets it when this turn ends')
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
     await clock.advance(1000)
     await clock.settle()
 
     expect(world.submitted).toHaveLength(0)
     expect(world.appended).toHaveLength(0)
     expect(await textOf(ui, 'saved-1')).toContain('not sent yet')
+    // The pane has the room to say what is not sent; the status line says it short.
+    expect(await textOf(ui, 'head')).toContain('✓ 1 response not sent yet')
     expect(world.status).toBe('✓ 1 not sent yet · /my-tasks')
 
     await $.turn.complete({ ...DONE, turnId: 't1' })
@@ -604,8 +1546,8 @@ describe('responding', () => {
     const ui = await $.ui.mount(PANE)
 
     await ui.press({ key: 'answer' })
-    expect((await ui.find({ type: 'Input', key: 'answer' }))?.props.placeholder).toBe('Enter saves it; Claude gets it with your other answers')
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.placeholder).toBe('Enter saves it; Claude gets it with your other answers')
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
     await clock.advance(1000)
     await $.turn.complete({ ...DONE, turnId: 't1' })
     await clock.settle()
@@ -628,7 +1570,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
     await clock.advance(1000)
     await $.turn.complete({ ...DONE, turnId: 't1' })
     await clock.settle()
@@ -657,7 +1599,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
     await clock.advance(1000)
     await $.turn.complete({ ...DONE, turnId: 't1' })
     await clock.settle()
@@ -684,7 +1626,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
     await clock.advance(1000)
     await $.turn.complete({ ...DONE, turnId: 't1' })
     await clock.settle()
@@ -705,7 +1647,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed with token abc123' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed with token abc123' })
     await clock.advance(1000)
     await $.turn.complete({ ...DONE, turnId: 't1' })
     await clock.settle()
@@ -728,7 +1670,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
     await ui.press({ key: 'option-1' })
     await clock.advance(1000)
     await $.turn.complete({ ...DONE, turnId: 't1' })
@@ -792,7 +1734,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
     await clock.advance(1000)
     await $.turn.complete({ ...DONE, turnId: 't1' })
     await clock.settle()
@@ -812,6 +1754,22 @@ describe('responding', () => {
     expect(next.context?.[0]).toContain('LoginTests.testExpiredToken failed')
   })
 
+  test("of two saved responses, the first row's Send now answers s and the other a click", async ($, on) => {
+    seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(PAGING_TASK)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Two failures' })
+    await ui.press({ key: 'option-1' })
+
+    expect((await ui.find({ type: 'Button', key: 'send-1' }))?.props.hotkey).toBe('s')
+    expect((await ui.find({ type: 'Button', key: 'send-2' }))?.props.hotkey).toBeUndefined()
+  })
+
   test('Send now while Claude works reaches it in the turn', async ($, on) => {
     const { world, clock } = seat(on)
     await start($)
@@ -821,7 +1779,7 @@ describe('responding', () => {
     const ui = await $.ui.mount(PANE)
 
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'CartTests.testCouponRounding', kind: 'change' })
+    await ui.input({ key: 'answer-1', text: 'CartTests.testCouponRounding', kind: 'change' })
     await ui.press({ key: 'other-way' })
     await clock.advance(1000)
     await clock.settle()
@@ -848,7 +1806,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
     await clock.advance(1000)
 
     // The row takes a moment to join the conversation, and the user types meanwhile.
@@ -873,7 +1831,7 @@ describe('responding', () => {
     const ui = await $.ui.mount(PANE)
 
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'CartTests.testCouponRounding', kind: 'change' })
+    await ui.input({ key: 'answer-1', text: 'CartTests.testCouponRounding', kind: 'change' })
     await ui.press({ key: 'other-way' })
     await clock.advance(1000)
     await clock.settle()
@@ -897,7 +1855,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'CartTests.testCouponRounding', kind: 'change' })
+    await ui.input({ key: 'answer-1', text: 'CartTests.testCouponRounding', kind: 'change' })
 
     // The row is refused a moment after it goes, and the turn ends meanwhile.
     world.refusingRows = 'No conversation to append to.'
@@ -921,7 +1879,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
     await clock.advance(1000)
 
     await Promise.all([ui.press({ key: 'send-1' }), ui.press({ key: 'send-1' })])
@@ -940,7 +1898,7 @@ describe('responding', () => {
 
     await ui.press({ key: 'option-1' })
     await ui.press({ key: 'reject' })
-    await ui.input({ key: 'reason', text: 'I will do it after the deploy' })
+    await ui.input({ key: 'reason-2', text: 'I will do it after the deploy' })
     await clock.advance(1000)
     await clock.settle()
 
@@ -982,7 +1940,7 @@ describe('responding', () => {
     await $.tool.call(XCODE_TASK)
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: KEY_SHAPED })
+    await ui.input({ key: 'answer-1', text: KEY_SHAPED })
     await clock.advance(1000)
     await clock.settle()
 
@@ -998,7 +1956,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'go', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'Two failures' })
+    await ui.input({ key: 'answer-1', text: 'Two failures' })
 
     const listed = await $.tool.call({ tool: LIST })
     expect(String((listed as { result?: unknown }).result)).toContain('Two failures')
@@ -1014,7 +1972,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'go', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'Two failures' })
+    await ui.input({ key: 'answer-1', text: 'Two failures' })
     await ui.press({ key: 'option-1' })
 
     expect(world.status).toBe('✓ 2 not sent yet · /my-tasks')
@@ -1033,7 +1991,7 @@ describe('responding', () => {
     await $.turn.start({ text: 'go', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'Two failures' })
+    await ui.input({ key: 'answer-1', text: 'Two failures' })
     // list_tasks reads the task list late: Done on #2 lands meanwhile, and
     // its write of #1 heard reads the list again.
     world.slowRead = 'tasks'
@@ -1053,6 +2011,333 @@ describe('responding', () => {
 
     expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#2 Add STRIPE_SECRET_KEY to .env: Done.'])
   })
+
+  test('a withdraw that meets an answer given a moment before leaves the answer, and Claude hears it', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+    // The withdraw reads the task list late: Done lands meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const withdrawn = $.tool.call({ tool: WITHDRAW, id: 1, reason: 'Found the key in the vault' })
+    await clock.advance(1)
+    await ui.press({ key: 'done' })
+    await clock.advance(500)
+
+    expect(((await withdrawn) as { deny?: string }).deny).toBe('Task #1 is already done; there is nothing to withdraw.')
+    expect(world.toasts).toEqual([])
+
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Add STRIPE_SECRET_KEY to .env: Done.'])
+  })
+
+  test('a press from a render older than a withdraw leaves the task withdrawn, and a toast says so', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(KEY_TASK)
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    // Done reads the task list late: Claude withdraws #1 meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const pressed = ui.press({ key: 'done' })
+    await clock.advance(1)
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    await clock.advance(500)
+    await pressed
+    await clock.settle()
+
+    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved.")
+    expect(world.submitted).toEqual([])
+    expect(world.status).toBe('☐ 1 task for you · /my-tasks')
+  })
+
+  test('Save for later with nothing typed asks for an answer, or, pressed as Claude withdraws its task, says the task is gone', async ($, on) => {
+    const { world } = seat(on)
+    const held = holdingPresses(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.press({ key: 'other-way' })
+
+    expect(world.toasts.at(-1)).toBe('Type an answer first, or press Cancel.')
+
+    held.isOn = true
+    const pressed = ui.press({ key: 'other-way' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    held.letGo()
+    await pressed
+
+    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved.")
+  })
+
+  test('Save for later pressed as Claude withdraws its task puts what was typed in the prompt box', async ($, on) => {
+    const { world, clock } = seat(on)
+    const held = holdingPresses(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await clock.settle()
+    // Save for later reaches its button as Claude withdraws the task, the
+    // draft gone with it, before the drawing that withdraw wakes.
+    held.isOn = true
+    const pressed = ui.press({ key: 'other-way' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    held.letGo()
+    await pressed
+
+    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved. What you typed is in the prompt box.")
+    expect(world.composer).toBe('LoginTests.testExpiredToken failed')
+  })
+
+  test('Long answer… pressed as Claude withdraws its task says the task is gone, and puts what was typed in the prompt box', async ($, on) => {
+    const { world, clock } = seat(on)
+    const held = holdingPresses(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await clock.settle()
+    held.isOn = true
+    const pressed = ui.press({ key: 'long' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    held.letGo()
+    await pressed
+
+    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved. What you typed is in the prompt box.")
+    expect(world.composer).toBe('LoginTests.testExpiredToken failed')
+  })
+
+  test('a title pressed as Claude withdraws its task leaves the field open on another task', async ($, on) => {
+    const { world, clock } = seat(on)
+    const held = holdingPresses(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'select-2' })
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-2', text: 'Pixel 8 passes', kind: 'change' })
+    await clock.settle()
+    held.isOn = true
+    const pressed = ui.press({ key: 'select-1' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    held.letGo()
+    await pressed
+
+    expect(await ui.find({ type: 'Input', key: 'answer-2' })).toBeDefined()
+    expect(world.toasts.at(-1)).toBe('Claude withdrew the task: Run xcodebuild test on your Mac, paste the failures')
+  })
+
+  test('Save for later pressed as the same answer lands from the prompt box says nothing, as a second press does', async ($, on) => {
+    const { world, clock } = seat(on)
+    const held = holdingPresses(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Two failures', kind: 'change' })
+    await clock.settle()
+    held.isOn = true
+    const pressed = ui.press({ key: 'other-way' })
+    await $.prompt.submit(typed('↳ Answer to #1: Two failures'))
+    held.letGo()
+    await pressed
+
+    expect(world.toasts).toEqual([])
+    expect(world.composer).toBe('')
+  })
+
+  test('an answer held for looking like a secret, entered as Claude withdraws its task, says the task is gone', async ($, on) => {
+    const { world } = seat(on)
+    // Held, an input reaches its field once the test lets it go.
+    let isHeld = false
+    let letGo = () => {}
+    on('ui.input', async ($, e, next) => {
+      if (isHeld) {
+        isHeld = false
+        await new Promise<void>(resolve => {
+          letGo = resolve
+        })
+      }
+
+      return next(e)
+    })
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    isHeld = true
+    const entered = ui.input({ key: 'answer-1', text: KEY_SHAPED })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    letGo()
+    await entered
+
+    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved.")
+    expect(world.composer).toBe('')
+  })
+
+  test('a task withdrawn as the user types for it takes the drafts along, and leaves the prompt box as the user has it', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await ui.press({ key: 'cancel' })
+    await ui.press({ key: 'reject' })
+    await ui.input({ key: 'reason-1', text: 'Not on this Mac', kind: 'change' })
+    await clock.settle()
+    world.composer = 'Also bump the version'
+    await $.tool.call({ tool: WITHDRAW, id: 1, reason: 'Found it in the CI logs' })
+
+    expect(world.composer).toBe('Also bump the version')
+    expect(world.toasts.at(-1)).toBe('Claude withdrew the task: Run xcodebuild test on your Mac, paste the failures. Found it in the CI logs')
+  })
+
+  test("of two presses from one render, the response that lands first stands, and a toast says the other wasn't saved", async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(PAGING_TASK)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+    // Offset reads the task list late: Cursor lands meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const pressed = ui.press({ key: 'option-2' })
+    await clock.advance(1)
+    await ui.press({ key: 'option-1' })
+    await clock.advance(500)
+    await pressed
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Pick a pagination strategy for /feed: I chose "Cursor".'])
+    expect(world.toasts).toEqual(["Task #1 isn't open any more, so your response wasn't saved."])
+  })
+
+  test('the same press twice from one render answers once, says nothing, and holds back no batch under way', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(PAGING_TASK)
+    const ui = await $.ui.mount(PANE)
+    // The first press reads the task list late: the second lands meanwhile, and the batch starts.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const pressed = ui.press({ key: 'option-1' })
+    await clock.advance(1)
+    world.ops = []
+    await ui.press({ key: 'option-1' })
+    await clock.advance(500)
+    await pressed
+
+    // The press that found it answered changed nothing, so wrote nothing.
+    expect(world.ops).toEqual([`set ${keysOf('/repo').session('session-1')}`])
+
+    await clock.advance(300)
+
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Pick a pagination strategy for /feed: I chose "Cursor".'])
+    expect(world.toasts).toEqual([])
+  })
+
+  test("an answer typed for a task answered meanwhile on another surface isn't saved: a toast says so, and it goes to the prompt box", async ($, on) => {
+    const { world, clock } = seat(on)
+    world.composer = 'and check the cart'
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Two failures', kind: 'change' })
+    await clock.settle()
+    // The answer reads the task list late: Done on the phone lands meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const answered = ui.input({ key: 'answer-1', text: 'Two failures' })
+    await clock.advance(1)
+    await phone.press({ key: 'done' })
+    await clock.advance(500)
+    await answered
+    await clock.advance(1000)
+
+    expect(world.toasts).toEqual(["Task #1 isn't open any more, so your response wasn't saved. What you typed is in the prompt box."])
+    expect(world.composer).toBe('and check the cart\nTwo failures')
+    expect(world.submitted).toEqual(['My response to a task you gave me (Human in the loop):\n\n#1 Run xcodebuild test on your Mac, paste the failures: Done.'])
+  })
+
+  test('an answer held for looking like a secret, sent anyway as its task is answered elsewhere, stays out of the prompt box', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: KEY_SHAPED })
+    await clock.settle()
+    // Send anyway reads the task list late: Done on the phone lands meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const sent = ui.press({ key: 'send-anyway' })
+    await clock.advance(1)
+    await phone.press({ key: 'done' })
+    await clock.advance(500)
+    await sent
+
+    expect(world.toasts).toEqual(["Task #1 isn't open any more, so your response wasn't saved."])
+    expect(world.composer).toBe('')
+  })
+
+  test('Send now repeating an answer saved for later a moment before sends it', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Two failures', kind: 'change' })
+    await clock.settle()
+    // Send now reads the task list late: Enter saves the same answer meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const pressed = ui.press({ key: 'other-way' })
+    await clock.advance(1)
+    await ui.input({ key: 'answer-1', text: 'Two failures' })
+    await clock.advance(500)
+    await pressed
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(world.appended.map(row => row.type)).toEqual(['user', 'system'])
+    expect(world.appended[0]?.text).toContain('Two failures')
+    expect(world.toasts).toEqual([])
+  })
 })
 
 describe('long answers in the prompt box', () => {
@@ -1069,6 +2354,23 @@ describe('long answers in the prompt box', () => {
     const sent = await $.prompt.submit(typed('↳ Answer to #1: LoginTests.testExpiredToken\nCartTests.testCouponRounding'))
 
     expect(sent.text).toContain('#1 Run xcodebuild test on your Mac, paste the failures:\nLoginTests.testExpiredToken\nCartTests.testCouponRounding')
+  })
+
+  test('a draft goes with Long answer… into the prompt box, and the field opens empty after', async ($, on) => {
+    const { world } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken', kind: 'change' })
+    await ui.press({ key: 'long' })
+
+    expect(world.composer).toBe('↳ Answer to #1: LoginTests.testExpiredToken')
+
+    await ui.press({ key: 'answer' })
+
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('')
   })
 
   test('typed while Claude is idle and dropped by a hook beneath, the answer is kept to send', async ($, on) => {
@@ -1138,6 +2440,29 @@ describe('long answers in the prompt box', () => {
 
     const listed = await $.tool.call({ tool: LIST })
     expect(String((listed as { result?: unknown }).result)).toContain('Two failures')
+  })
+
+  test('typed while Claude works, an answer to a task Claude withdraws meanwhile goes as typed', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    // The prompt reads the task list late: Claude withdraws #1 meanwhile.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const sending = $.prompt.submit(typed('↳ Answer to #1: Two failures', 't1'))
+    await clock.advance(1)
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    await clock.advance(500)
+    const sent = await sending
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await clock.settle()
+
+    expect(sent.drop).toBeUndefined()
+    expect(sent.text).toBe('↳ Answer to #1: Two failures')
+    expect(sent.context).toBeUndefined()
+    expect(world.submitted).toEqual([])
   })
 })
 
@@ -1750,7 +3075,7 @@ describe('across sessions', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed' })
     await clock.advance(1000)
     await $.turn.complete({ ...DONE, turnId: 't1' })
     await clock.settle()
@@ -1944,6 +3269,203 @@ describe('across sessions', () => {
 
     expect(world.submitted).toHaveLength(2)
     expect(world.submitted[1]).toContain('#7 Rotate the leaked token in Vault')
+  })
+
+  /** Session x drew #1 at the same moment as this one, and ended: the session after /clear takes it on as #1. */
+  async function clearTakingOnAnotherOne($: Engine, { world, clock }: ReturnType<typeof seat>) {
+    world.store[KEYS.session('session-x')] = {
+      tasks: [{ ...ROTATE, id: 1, sessionId: 'session-x' }],
+      seenMs: NOW - 60_000,
+      endedMs: NOW - 60_000,
+      nextId: 2,
+    }
+    world.sessionId = 'session-2'
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    await clock.advance(1)
+    await clock.settle()
+  }
+
+  test('a task that comes back after /clear under the number of one Claude withdrew takes nothing typed for that one, open or closed', async ($, on) => {
+    const seated = seat(on)
+    const { world, clock } = seated
+    const held = holdingPresses(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await clock.settle()
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    await clearTakingOnAnotherOne($, seated)
+
+    expect(slotsIn(world.store)['session-2']?.tasks.map(task => [task.id, task.title])).toEqual([
+      [1, ROTATE.title],
+      [2, ANDROID_TASK.title],
+    ])
+
+    await ui.press({ key: 'select-1' })
+    await ui.press({ key: 'answer' })
+    await ui.press({ key: 'other-way' })
+    await clock.settle()
+
+    expect(world.toasts.at(-1)).toBe('Type an answer first, or press Cancel.')
+    expect(slotsIn(world.store)['session-2']?.tasks.find(task => task.id === 1)?.state).toBe('open')
+    expect(world.composer).toBe('')
+
+    // Withdrawn as Save for later is pressed again, with nothing typed for it.
+    held.isOn = true
+    const pressed = ui.press({ key: 'other-way' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    held.letGo()
+    await pressed
+
+    expect(world.toasts.at(-1)).toBe("Task #1 isn't open any more, so your response wasn't saved.")
+    expect(world.composer).toBe('')
+  })
+
+  test("keys that reach a field as Claude withdraws its task leave nothing for a task back under its number after /clear, and the session's own drafts stay", async ($, on) => {
+    const seated = seat(on)
+    // Held, an input reaches its field once the test lets it go.
+    let isHeld = false
+    let letGo = () => {}
+    on('ui.input', async ($, e, next) => {
+      if (isHeld) {
+        isHeld = false
+        await new Promise<void>(resolve => {
+          letGo = resolve
+        })
+      }
+
+      return next(e)
+    })
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'select-2' })
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-2', text: 'Pixel 8 passes', kind: 'change' })
+    await ui.press({ key: 'select-1' })
+    await ui.press({ key: 'answer' })
+    // A key reaches #1's field as Claude withdraws the task, before the drawing that withdraw wakes.
+    isHeld = true
+    const entered = ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    letGo()
+    await entered
+    await clearTakingOnAnotherOne($, seated)
+    await ui.press({ key: 'select-1' })
+    await ui.press({ key: 'answer' })
+
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('')
+
+    await ui.press({ key: 'select-2' })
+    await ui.press({ key: 'answer' })
+
+    expect((await ui.find({ type: 'Input', key: 'answer-2' }))?.props.value).toBe('Pixel 8 passes')
+  })
+
+  for (const [label, key, field] of [
+    ['Answer…', 'answer', 'answer-1'],
+    ['Reject…', 'reject', 'reason-1'],
+  ] as const) {
+    test(`${label} pressed as Claude withdraws its task neither selects nor opens a field on a task back under its number after /clear`, async ($, on) => {
+      const seated = seat(on)
+      const held = holdingPresses(on)
+      await start($)
+
+      await $.tool.call(XCODE_TASK)
+      await $.tool.call(ANDROID_TASK)
+      const ui = await $.ui.mount(PANE)
+      held.isOn = true
+      const pressed = ui.press({ key })
+      await $.tool.call({ tool: WITHDRAW, id: 1 })
+      held.letGo()
+      await pressed
+      await clearTakingOnAnotherOne($, seated)
+
+      // #2 stays the one selected, its why drawn, and the task back under #1 stays shut.
+      expect(await textOf(ui, 'task-2')).toContain(XCODE_TASK.why)
+      expect(await textOf(ui, 'task-1')).not.toContain(ROTATE.why)
+      expect(await ui.find({ type: 'Input', key: field })).toBeUndefined()
+    })
+  }
+
+  test('Answer… that reads its task open just before Claude withdraws it leaves no field for a task back under its number after /clear', async ($, on) => {
+    const seated = seat(on)
+    const { world, clock } = seated
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    // The press reads the tasks late, as they stood before the withdraw.
+    world.slowRead = 'tasks'
+    world.readMs = 500
+    const pressed = ui.press({ key: 'answer' })
+    await clock.settle()
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    await clock.advance(500)
+    await pressed
+    await clearTakingOnAnotherOne($, seated)
+
+    expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
+  })
+
+  test("a task the join after a resume in place numbers anew, as the resumed session's own task keeps the number, keeps its field, its draft and the ring", async ($, on) => {
+    const { world, clock } = seat(on)
+    const failures = 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error'
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(inline(60))
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: failures, kind: 'change' })
+    await clock.settle()
+    // Session 0 drew #1 at the same moment as this one, and ended; this one resumes it in place.
+    world.store[KEYS.session('session-0')] = { tasks: [{ ...ROTATE, id: 1, sessionId: 'session-0' }], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 2 }
+    world.sessionId = 'session-0'
+    await $.session.end({ reason: 'resume', sessionId: 'session-1', resume: { id: 'session-0' } })
+    await clock.advance(1)
+    await clock.settle()
+
+    // The Xcode task is #3 now, still selected, its field open with the draft; session 0's own task keeps #1.
+    expect(await textOf(ui, 'task-3')).toContain(XCODE_TASK.title)
+    expect((await ui.find({ type: 'Input', key: 'answer-3' }))?.props.value).toBe(failures)
+    expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
+
+    // The ring went along: moved onto the field, it leaves the rows as they are.
+    const rows = world.opens.at(-1)?.rows
+    await $.ui.focus(ringTo('answer-3'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows)
+  })
+
+  test("after /clear the tasks the process holds keep their numbers and the open field, though another session's slot holding one of them comes first", async ($, on) => {
+    // Session x's slot is first in the store.
+    const seated = seat(on, { [KEYS.session('session-x')]: { tasks: [], seenMs: NOW, nextId: 1 } })
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Two failures', kind: 'change' })
+    await seated.clock.settle()
+    await clearTakingOnAnotherOne($, seated)
+
+    // Session x's task is #3 now, and the Xcode task, still #1, stays selected.
+    expect(await textOf(ui, 'task-3')).toContain(ROTATE.title)
+    expect(await textOf(ui, 'task-3')).not.toContain(ROTATE.why)
+    expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeDefined()
+
+    // Claude withdrawing #1 withdraws the Xcode task.
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    expect(seated.world.toasts.at(-1)).toBe('Claude withdrew the task: Run xcodebuild test on your Mac, paste the failures')
   })
 
   test('a session that ends after /clear before its join has begun ends all the same and takes nothing quiet', async ($, on) => {
@@ -2510,7 +4032,7 @@ describe('across sessions', () => {
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
     // Typed, not sent.
-    await ui.input({ key: 'answer', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
+    await ui.input({ key: 'answer-1', text: 'LoginTests.testExpiredToken failed', kind: 'change' })
     world.sessionId = 'session-3'
     world.root = '/other'
     await $.session.end({ reason: 'resume', sessionId: 'session-1', resume: { id: 'session-3' } })
@@ -2520,9 +4042,9 @@ describe('across sessions', () => {
     const assigned = await $.tool.call({ ...XCODE_TASK, title: 'Run the Android tests on your phone, paste the failures' })
     expect(String((assigned as { result?: unknown }).result)).toContain('Assigned task #1')
 
-    expect(await ui.find({ type: 'Input', key: 'answer' })).toBeUndefined()
+    expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
     await ui.press({ key: 'answer' })
-    expect((await ui.find({ type: 'Input', key: 'answer' }))?.props.value).toBe('')
+    expect((await ui.find({ type: 'Input', key: 'answer-1' }))?.props.value).toBe('')
   })
 
 
@@ -2535,7 +4057,7 @@ describe('across sessions', () => {
     await $.turn.start({ text: 'fix the login bug', turnId: 't1' })
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: 'CartTests.testCouponRounding', kind: 'change' })
+    await ui.input({ key: 'answer-1', text: 'CartTests.testCouponRounding', kind: 'change' })
     await ui.press({ key: 'other-way' })
     await clock.advance(1000)
     world.sessionId = 'session-3'
@@ -2960,7 +4482,7 @@ describe('the README example', () => {
     expect(world.submitted).toHaveLength(0)
 
     await ui.press({ key: 'answer' })
-    await ui.input({ key: 'answer', text: '@acme/stripe-hooks' })
+    await ui.input({ key: 'answer-3', text: '@acme/stripe-hooks' })
     await clock.advance(1000)
     await clock.settle()
 

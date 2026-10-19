@@ -261,6 +261,9 @@ const refOf = (task: Task): TaskRef => ({ id: task.id, createdMs: task.createdMs
 
 const isSameRef = (one: TaskRef, other: TaskRef) => one.id === other.id && one.createdMs === other.createdMs
 
+/** Whether `one` and `other` are one task: a number alone can name two, drawn by two sessions at once. */
+export const isSameTask = (one: Task, other: Task) => one.sessionId === other.sessionId && isSameRef(one, other)
+
 /** The refs of `refs` that `others` doesn't name. */
 const without = (refs: readonly TaskRef[], others: readonly TaskRef[]) => refs.filter(ref => !others.some(other => isSameRef(other, ref)))
 
@@ -358,6 +361,8 @@ function dropLegacyCopy(project: Project, id: string, legacy: LegacyEdit) {
 export type Adoption = {
   /** Its own tasks (a resumed session) and those of sessions that ended or went quiet. */
   adopted: Task[]
+  /** Those it numbered anew, another having drawn their numbers too: each as it was, with its new number. */
+  renumbered: { task: Task; id: number }[]
   /**
    * Its notes of what it took: each kept in its slot, so a crash anywhere
    * after leaves no task twice. Until that write lands, a session it took
@@ -381,7 +386,9 @@ export type Adoption = {
  *
  * Two sessions assigning at the same moment can draw one number (the store
  * has no way to reserve one): where their tasks meet here, the session's own
- * keep theirs, the numbers its Claude knows, and a later one gets a new one.
+ * keep theirs, the numbers its Claude knows, then those of `holder`, the
+ * session whose tasks the process holds (the one it left with /clear or a
+ * resume in place), the numbers the user knows, and a later one gets a new one.
  * So does one with a number in `known`, the session's own tasks that it is
  * done with, in no slot, or in a 0.1.4 note of tasks taken from it: a copy
  * of that note a 0.1.4 session's write puts back would take it again.
@@ -389,10 +396,12 @@ export type Adoption = {
  * A session taking the project on as it ends (`isEnding`) takes nothing from
  * a quiet one, which may come back: the next session to start takes it on.
  */
-export function adopt(project: Project, sessionId: string, nowMs: number, known: readonly number[] = [], isEnding = false): Adoption {
+export function adopt(project: Project, sessionId: string, nowMs: number, known: readonly number[] = [], isEnding = false, holder: string | null = null): Adoption {
   const all = project.all
-  const ids = Object.keys(all).sort((a, b) => Number(b === sessionId) - Number(a === sessionId))
+  const rank = (id: string) => (id === sessionId ? 0 : id === holder ? 1 : 2)
+  const ids = Object.keys(all).sort((a, b) => rank(a) - rank(b))
   const adopted: Task[] = []
+  const renumbered: Adoption['renumbered'] = []
   const took: Record<string, Took> = {}
   const removed: string[] = []
   const legacy = ownLegacy(project, sessionId)
@@ -410,8 +419,12 @@ export function adopt(project: Project, sessionId: string, nowMs: number, known:
     const held = heldIn(project, id, slot)
 
     for (const task of held) {
-      const isDrawn = adopted.some(one => one.id === task.id) || drawn.includes(task.id)
-      adopted.push(isDrawn ? { ...task, id: nextId++ } : task)
+      if (adopted.some(one => one.id === task.id) || drawn.includes(task.id)) {
+        renumbered.push({ task, id: nextId })
+        adopted.push({ ...task, id: nextId++ })
+      } else {
+        adopted.push(task)
+      }
     }
 
     if (id === sessionId) {
@@ -449,7 +462,7 @@ export function adopt(project: Project, sessionId: string, nowMs: number, known:
 
   adopted.sort((a, b) => a.id - b.id)
 
-  return { adopted, took, nextId, removed, legacy }
+  return { adopted, renumbered, took, nextId, removed, legacy }
 }
 
 /**

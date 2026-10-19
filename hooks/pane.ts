@@ -1,6 +1,6 @@
 import type { Editing, Task } from '../types'
-import { isActive } from './tasks'
-import { ago, cellsOf, plural, printable, rowsOf } from './text'
+import { MAX_OPTION, MAX_WHY, isActive, waitingOf } from './tasks'
+import { ago, cellsOf, clip, printable, rowsOf } from './text'
 
 /**
  * The longest title the pane and the transcript draw. `assign_task` takes
@@ -15,6 +15,9 @@ export const BUTTON_GAP = 3
 /** The cells before a task's text: its glyph, `☐ `. */
 const GLYPH_CELLS = 2
 
+/** The fewest columns the terminal gives a focused field's text, however narrow the pane. */
+const MIN_FIELD_COLUMNS = 12
+
 /**
  * What the My tasks pane draws from: the tasks, which is selected and which
  * field is open, and what each row's words depend on. The render hook and
@@ -24,7 +27,7 @@ export type PaneView = {
   shown: readonly Task[]
   selectedId: number | null
   editing: Editing | null
-  /** The draft in the open answer field. */
+  /** The draft in the open field. */
   draft: string
   nowMs: number
   sessionId: string
@@ -32,6 +35,8 @@ export type PaneView = {
   /** The surface draws a text field (the mobile app draws none yet). */
   canType: boolean
   isFocused: boolean
+  /** The open field has the keys: the terminal wraps what is typed there. */
+  isTyping: boolean
 }
 
 export function selectedOf(view: PaneView): Task | undefined {
@@ -40,15 +45,9 @@ export function selectedOf(view: PaneView): Task | undefined {
   return active.find(task => task.id === view.selectedId) ?? active[0]
 }
 
+/** The pane's head: `☐ 2 tasks for you · 1 not sent yet`, or `✓ 1 response not sent yet`. */
 export function headlineOf(view: PaneView): { glyph: string; headline: string; note: string } {
-  const active = view.shown.filter(isActive).length
-  const saved = view.shown.length - active
-
-  return {
-    glyph: active > 0 ? '☐ ' : '✓ ',
-    headline: active > 0 ? `${plural(active, 'task')} for you` : `${plural(saved, 'response')} not sent yet`,
-    note: active > 0 && saved > 0 ? ` · ${saved} not sent yet` : '',
-  }
+  return waitingOf(view.shown, 'response')
 }
 
 /** A task's whole title, safe to draw. */
@@ -69,11 +68,11 @@ export function ageOf(task: Task, view: Pick<PaneView, 'nowMs' | 'sessionId'>): 
 }
 
 export function whyOf(task: Task): string {
-  return printable(task.why, 300)
+  return printable(task.why, MAX_WHY)
 }
 
 export function doneWhenOf(task: Task): string | undefined {
-  return task.doneWhen === undefined ? undefined : `Done when: ${printable(task.doneWhen, 300)}`
+  return task.doneWhen === undefined ? undefined : `Done when: ${printable(task.doneWhen, MAX_WHY)}`
 }
 
 /** A saved response's row: its task, and that it waits. */
@@ -85,7 +84,7 @@ export function savedOf(task: Task): string {
 export function actionsOf(task: Task, canType: boolean): { key: string; hotkey: string; label: string; option?: string }[] {
   const choices =
     task.kind === 'choose' && task.options !== undefined
-      ? task.options.map((option, i) => ({ key: `option-${i + 1}`, hotkey: String(i + 1), label: printable(option, 60), option }))
+      ? task.options.map((option, i) => ({ key: `option-${i + 1}`, hotkey: String(i + 1), label: printable(option, MAX_OPTION), option }))
       : [{ key: 'done', hotkey: 'd', label: 'Done' }]
 
   const typed = canType
@@ -98,9 +97,10 @@ export function actionsOf(task: Task, canType: boolean): { key: string; hotkey: 
   return [...choices, ...typed]
 }
 
-export const ANSWER_LABEL = 'Answer › '
-export const REASON_LABEL = 'Reason (optional) › '
-export const REASON_PLACEHOLDER = 'Enter rejects it'
+// The terminal draws a field's label as `Answer: `.
+export const ANSWER_LABEL = 'Answer'
+export const REASON_LABEL = 'Reason'
+export const REASON_PLACEHOLDER = 'Optional; Enter rejects it'
 export const HELD =
   'This looks like a secret. Claude and the transcript on disk would see it. Put it where it belongs and press Done instead.'
 
@@ -119,9 +119,72 @@ export function answerButtonsOf(view: PaneView): string[] {
   return [view.isWorking ? 'Send now' : 'Save for later', 'Long answer…', 'Cancel']
 }
 
-/** The first saved row's Send now answers `s`. */
+/** The key of task `id`'s field: its own, so no other task's draft, or the focus, lands in it. */
+export function fieldKeyOf(field: Pick<Editing, 'id' | 'field'>): string {
+  return `${field.field}-${field.id}`
+}
+
+/** What Enter does in a field, drawn beside it while it has the keys. */
+export function submitLabelOf(field: Editing['field'], view: Pick<PaneView, 'isWorking'>): string {
+  return field === 'reason' ? 'reject' : view.isWorking ? 'save' : 'send'
+}
+
+/**
+ * The columns the terminal gives a focused field's text: the pane's body,
+ * `columns` across, less the label (`Answer: `) and the hint (` ⏎ send`).
+ */
+export function fieldColumnsOf(label: string, submitLabel: string, columns: number): number {
+  return Math.max(MIN_FIELD_COLUMNS, columns - cellsOf(`${label}: `) - cellsOf(` ⏎ ${submitLabel}`))
+}
+
+/** A placeholder cut to one row of its field, focused or not. */
+export function placeholderOf(text: string, label: string, submitLabel: string, columns: number): string {
+  return clip(text, fieldColumnsOf(label, submitLabel, columns))
+}
+
+/**
+ * Whether the terminal cuts a label `head` cells wide short, with `rest`
+ * cells after it on a row `columns` across, and wraps it onto a second: a row
+ * too narrow takes from the label and what follows it each its share of what
+ * the row lacks, and rounds where the label ends.
+ */
+function isLabelCut(head: number, rest: number, columns: number): boolean {
+  return Math.round((head * columns) / (head + rest)) < head
+}
+
+/**
+ * The rows a field takes across the pane's body, `columns` wide, holding
+ * `text`. The terminal draws its label, the field and, while it has the
+ * keys, the hint on one row, and the label, cut short, wraps onto a second,
+ * as does the hint. Typed in, the field wraps the text a column short of it,
+ * for the cursor; else it cuts the text, or the placeholder, to one row.
+ */
+export function fieldRowsOf(label: string, submitLabel: string, text: string, isTyping: boolean, columns: number): number {
+  const head = cellsOf(`${label}: `)
+  const field = fieldColumnsOf(label, submitLabel, columns)
+
+  if (!isTyping) {
+    // The placeholder is cut to the field.
+    return isLabelCut(head, text === '' ? field : cellsOf(text), columns) ? 2 : 1
+  }
+
+  const rows = text.split('\n').reduce((rows, line) => rows + rowsOf(line, field - 1), 0)
+  // The placeholder cut to the field, or the text and the cursor.
+  const drawn = text === '' ? field : cellsOf(text) + 1
+
+  return Math.max(rows, isLabelCut(head, drawn + cellsOf(` ⏎ ${submitLabel}`), columns) ? 2 : 1)
+}
+
+/** The `i`th saved row's Send now: the first answers `s`. */
+export function sendNowOf(i: number): { hotkey?: string; label: string } {
+  return i === 0 ? { hotkey: 's', label: 'Send now' } : { label: 'Send now' }
+}
+
+/** The `i`th saved row's Send now as the terminal draws it: `s: Send now` on the first. */
 export function sendLabelOf(i: number): string {
-  return i === 0 ? 's: Send now' : 'Send now'
+  const { hotkey, label } = sendNowOf(i)
+
+  return hotkey === undefined ? label : `${hotkey}: ${label}`
 }
 
 export function hintOf(view: PaneView): string {
@@ -175,7 +238,7 @@ export function rowsFor(view: PaneView, columns: number, max: number): number {
     rows += rowsOf(whyOf(task), inner)
     const doneWhen = doneWhenOf(task)
     rows += doneWhen === undefined ? 0 : rowsOf(doneWhen, inner)
-    rows += controlRowsOf(task, view, inner)
+    rows += controlRowsOf(task, view, width, inner)
   }
 
   saved.forEach((task, i) => {
@@ -187,25 +250,22 @@ export function rowsFor(view: PaneView, columns: number, max: number): number {
   return Math.min(max, rows)
 }
 
-function controlRowsOf(task: Task, view: PaneView, columns: number): number {
+/** The rows under the selected task: its buttons, or its field across the body (`width`) and the buttons under it. */
+function controlRowsOf(task: Task, view: PaneView, width: number, inner: number): number {
   const field = view.editing !== null && view.editing.id === task.id ? view.editing : null
 
   if (field === null || !view.canType) {
     return buttonRowsOf(
       actionsOf(task, view.canType).map(action => `${action.hotkey}: ${action.label}`),
-      columns,
+      inner,
     )
   }
 
-  if (field.field === 'reason') {
-    return rowsOf(`${REASON_LABEL}${REASON_PLACEHOLDER}`, columns) + 1
-  }
-
   if (field.held !== undefined) {
-    return rowsOf(HELD, columns) + buttonRowsOf(['Edit', 'Send anyway'], columns)
+    return rowsOf(HELD, inner) + buttonRowsOf(['Edit', 'Send anyway'], inner)
   }
 
-  const shown = view.draft === '' ? answerPlaceholderOf(view) : view.draft
+  const [label, buttons] = field.field === 'answer' ? [ANSWER_LABEL, answerButtonsOf(view)] : [REASON_LABEL, ['Cancel']]
 
-  return rowsOf(`${ANSWER_LABEL}${shown}`, columns) + buttonRowsOf(answerButtonsOf(view), columns)
+  return fieldRowsOf(label, submitLabelOf(field.field, view), view.draft, view.isTyping, width) + buttonRowsOf(buttons, inner)
 }

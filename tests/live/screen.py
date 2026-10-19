@@ -24,8 +24,43 @@ def run(*args, check=True, **kw):
     return subprocess.run(args, check=check, capture_output=True, text=True, **kw)
 
 
-def capture(session):
-    return run('tmux', 'capture-pane', '-p', '-t', session).stdout
+def capture(session, escapes=False):
+    """The screen as text; with `escapes`, its colors and styles kept as the terminal's escape codes."""
+    return run('tmux', 'capture-pane', '-p', *(['-e'] if escapes else []), '-t', session).stdout
+
+
+# Set, every screen a test reads is kept there too, for a person to look over.
+RENDERS = os.environ.get('RENDERS_DIR')
+kept = 0
+
+
+def keep(styled, name):
+    """Saves a screen read with its escapes under RENDERS_DIR, numbered in the order the tests read them."""
+    global kept
+
+    if not RENDERS:
+        return
+
+    kept += 1
+    os.makedirs(RENDERS, exist_ok=True)
+    # Only what a file name and the artifact's upload both take.
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', name)
+    with open(os.path.join(RENDERS, f'{kept:03d}-{safe}.ansi'), 'w') as f:
+        f.write(styled)
+
+
+# What `capture-pane -e` adds to the text: colors and styles, and any other CSI or OSC sequence.
+ESCAPES = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+
+
+def snapshot(session, name=None):
+    """The screen as text, read once and kept as `name` when given, colors and all: what is kept is what a test reads."""
+    styled = capture(session, escapes=True)
+    if name is not None:
+        keep(styled, name)
+    # As the plain capture reads it: that trims the spaces ending a row,
+    # styled ones too.
+    return '\n'.join(line.rstrip(' ') for line in ESCAPES.sub('', styled).split('\n'))
 
 
 def wait_for(session, predicate, timeout=30.0):
@@ -148,8 +183,8 @@ class Claude:
         with open(path, 'w') as f:
             json.dump({f'tasks:{self.project}#session:earlier': slot}, f)
 
-    def pane(self, columns, rows, keys=()):
-        """The screen with the pane opened by /my-tasks, after `keys`."""
+    def pane(self, columns, rows, keys=(), name=None):
+        """The screen with the pane opened by /my-tasks, after `keys`; kept as `name` when given."""
         self.start(columns, rows)
         # The session takes the tasks on as it starts; the status line counts
         # them once it has. /my-tasks typed before that finds none.
@@ -162,7 +197,7 @@ class Claude:
                 'if the engine names a --plugin-dir store otherwise now, store_file() must follow'
             ) from error
         self.command('/my-tasks')
-        screen = wait_for(self.session, lambda s: '╰' in s and 'for you' in s)
+        wait_for(self.session, has_pane)
         if keys:
             # The pane takes the keys when the prompt lets it; else ctrl+x tab hands them over.
             try:
@@ -173,11 +208,13 @@ class Claude:
         for key in keys:
             run('tmux', 'send-keys', '-t', self.session, key)
             time.sleep(0.5)
+        # Keys that close the pane and open it again leave it to come back.
+        wait_for(self.session, has_pane)
         time.sleep(1.0)
-        return capture(self.session)
+        return snapshot(self.session, name)
 
-    def transcript(self, columns, rows, tool_input):
-        """The screen of a session resumed from a transcript where Claude called assign_task."""
+    def transcript(self, columns, rows, tool_input, name=None):
+        """The screen of a session resumed from a transcript where Claude called assign_task; kept as `name` when given."""
         session = str(uuid.uuid4())
         folder = os.path.join(self.config, 'projects', re.sub(r'[^A-Za-z0-9]', '-', self.project))
         os.makedirs(folder, exist_ok=True)
@@ -208,11 +245,19 @@ class Claude:
         self.start(columns, rows, '--resume', session)
         wait_for(self.session, lambda s: '☐' in s)
         time.sleep(1.0)
-        return capture(self.session)
+        return snapshot(self.session, name)
 
     def close(self):
         self.stop()
         shutil.rmtree(self.home, ignore_errors=True)
+
+
+def has_pane(screen):
+    """Whether the pane is drawn whole: its frame, top to bottom, around its head or a task, which lead with ☐ or ✓ as the status line does not."""
+    try:
+        return any(row.startswith(('☐', '✓')) for row in pane_body(screen))
+    except StopIteration:
+        return False
 
 
 def pane_body(screen):

@@ -1606,10 +1606,10 @@ async function show($: EngineInterface, isAsked: boolean): Promise<boolean> {
   // A closed pane's fields are drawn with their drafts as it opens again:
   // the surfaces forget what they held as it closes. Its ring starts on the
   // open field, which takes it by autoFocus as the pane takes the keys.
-  // Asked only when there is a draft to draw; when the engine can't say,
-  // they are drawn so anyway, and a field still drawn gets back the text
-  // typed in it.
-  if (live.drafts.size > 0) {
+  // Asked only when there is a draft to draw or a field open to take the
+  // ring; when the engine can't say, they are drawn so anyway, and a field
+  // still drawn gets back the text typed in it.
+  if (live.drafts.size > 0 || (await read($, editing)) !== null) {
     const panes = await $.ui.panes().catch(() => undefined)
 
     if (panes === undefined || !panes.some(pane => pane.id === PANE)) {

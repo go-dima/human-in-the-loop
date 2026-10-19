@@ -1044,6 +1044,27 @@ describe('long titles', () => {
     expect(world.opens.at(-1)?.rows).toBe(13)
   })
 
+  test('an empty field in a narrow pane, hidden and opened again, takes the ring and asks for the row it squeezes onto', async ($, on) => {
+    const { world, clock } = seat(on, earlier([{ ...XCODE_LONG, title: 'Paste the failures', why: "I can't run Xcode." }]))
+    await start($)
+
+    await runTasks($)
+    const ui = await $.ui.mount(inline(24))
+    await ui.press({ key: 'answer' })
+    // Out of the keys, the field draws no hint: one row.
+    await $.ui.focus(ringTo('long'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+
+    // Hidden and opened again, the field's autoFocus takes the ring, and `⏎ send` squeezes under it.
+    await ui.press({ key: 'hide' })
+    await ui.unmount()
+    await runTasks($)
+    await $.ui.mount(inline(24))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(13)
+  })
+
   test('the transcript row keeps its label whole and wraps the title after it', async ($, on) => {
     seat(on)
     await start($)

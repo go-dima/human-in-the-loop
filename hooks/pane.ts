@@ -145,21 +145,22 @@ export function placeholderOf(text: string, label: string, submitLabel: string, 
 /**
  * The rows a field takes across the pane's body, `columns` wide, holding
  * `text`. Typed in, the terminal wraps the text beside the label, a column
- * short of the field for the cursor. Else it draws one row, the text cut
+ * short of the field for the cursor, and a row too narrow for the label, the
+ * field and the hint, by more than the column the field gives up, squeezes
+ * the label and the hint onto a second. Else it draws one row, the text cut
  * short, and a text past the row squeezes the label onto a second.
  */
 export function fieldRowsOf(label: string, submitLabel: string, text: string, isTyping: boolean, columns: number): number {
-  if (text === '') {
-    return 1
-  }
-
   if (!isTyping) {
-    return cellsOf(`${label}: ${text}`) > columns ? 2 : 1
+    return text !== '' && cellsOf(`${label}: ${text}`) > columns ? 2 : 1
   }
 
   const width = fieldColumnsOf(label, submitLabel, columns) - 1
+  const rows = text.split('\n').reduce((rows, line) => rows + rowsOf(line, width), 0)
+  // What the field draws, the placeholder cut to the field or the text and the cursor, less the column it gives up.
+  const drawn = text === '' ? width : cellsOf(text)
 
-  return text.split('\n').reduce((rows, line) => rows + rowsOf(line, width), 0)
+  return Math.max(rows, cellsOf(`${label}: `) + drawn + cellsOf(` ⏎ ${submitLabel}`) > columns ? 2 : 1)
 }
 
 /** The `i`th saved row's Send now: the first answers `s`. */

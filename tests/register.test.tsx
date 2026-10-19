@@ -1007,9 +1007,41 @@ describe('long titles', () => {
     // Out of the keys, one row, or two once the label is squeezed.
     expect(fieldRowsOf('Answer', 'send', 'x'.repeat(52), false, 60)).toBe(1)
     expect(fieldRowsOf('Answer', 'send', 'x'.repeat(53), false, 60)).toBe(2)
-    // However narrow the pane, the terminal gives the field 12 columns.
-    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(11), true, 20)).toBe(1)
-    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(12), true, 20)).toBe(2)
+    // However narrow the pane, the terminal gives the field 12 columns, its text 11.
+    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(22), true, 20)).toBe(2)
+    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(23), true, 20)).toBe(3)
+  })
+
+  test('a row too narrow for the label, the field and the hint squeezes them onto a second, as the terminal does around 30 columns', () => {
+    // As Claude Code 2.1.296 drew them at 30, 29 and 28 columns: bodies 26, 25 and 24 across.
+    // The placeholder takes the field's 12 columns, the text its cells and the cursor's; the field gives up one.
+    expect(fieldRowsOf('Answer', 'send', '', true, 26)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', '', true, 25)).toBe(2)
+    expect(fieldRowsOf('Reason', 'reject', '', true, 26)).toBe(2)
+    expect(fieldRowsOf('Answer', 'send', 'abc', true, 24)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', 'abcdefghij', true, 25)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', 'abcdefghijk', true, 26)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', 'abcdefghijk', true, 25)).toBe(2)
+  })
+
+  test('a field squeezed onto a second row in a narrow pane asks for that row', async ($, on) => {
+    const { world, clock } = seat(on, earlier([{ ...XCODE_LONG, title: 'Paste the failures', why: "I can't run Xcode." }]))
+    await start($)
+
+    await runTasks($)
+    // At 28 columns Claude Code 2.1.296 squeezes `⏎ send` under the empty field: 13 rows in all.
+    const ui = await $.ui.mount(inline(24))
+    await ui.press({ key: 'answer' })
+    expect(world.opens.at(-1)?.rows).toBe(13)
+
+    // A short answer leaves the hint room on its row.
+    await ui.input({ key: 'answer-2', text: 'abc', kind: 'change' })
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(12)
+
+    await ui.input({ key: 'answer-2', text: 'abcdefghijk', kind: 'change' })
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(13)
   })
 
   test('the transcript row keeps its label whole and wraps the title after it', async ($, on) => {

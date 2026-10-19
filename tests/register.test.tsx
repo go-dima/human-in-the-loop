@@ -3261,30 +3261,82 @@ describe('across sessions', () => {
     expect((await ui.find({ type: 'Input', key: 'answer-2' }))?.props.value).toBe('Pixel 8 passes')
   })
 
-  test('Answer… pressed as Claude withdraws its task neither selects nor opens a field on a task back under its number after /clear', async ($, on) => {
+  for (const [label, key, field] of [
+    ['Answer…', 'answer', 'answer-1'],
+    ['Reject…', 'reject', 'reason-1'],
+  ] as const) {
+    test(`${label} pressed as Claude withdraws its task neither selects nor opens a field on a task back under its number after /clear`, async ($, on) => {
+      const seated = seat(on)
+      const held = holdingPresses(on)
+      await start($)
+
+      await $.tool.call(XCODE_TASK)
+      await $.tool.call(ANDROID_TASK)
+      const ui = await $.ui.mount(PANE)
+      held.isOn = true
+      const pressed = ui.press({ key })
+      await $.tool.call({ tool: WITHDRAW, id: 1 })
+      held.letGo()
+      await pressed
+      await clearTakingOnAnotherOne($, seated)
+
+      // #2 stays the one selected, its why drawn, and the task back under #1 stays shut.
+      expect(await textOf(ui, 'task-2')).toContain(XCODE_TASK.why)
+      expect(await textOf(ui, 'task-1')).not.toContain(ROTATE.why)
+      expect(await ui.find({ type: 'Input', key: field })).toBeUndefined()
+    })
+  }
+
+  test('Answer… that reads its task open just before Claude withdraws it leaves no field for a task back under its number after /clear', async ($, on) => {
     const seated = seat(on)
-    const held = holdingPresses(on)
+    const { world, clock } = seated
     await start($)
 
     await $.tool.call(XCODE_TASK)
     await $.tool.call(ANDROID_TASK)
     const ui = await $.ui.mount(PANE)
-    held.isOn = true
+    // The press reads the tasks late, as they stood before the withdraw.
+    world.slowRead = 'tasks'
+    world.readMs = 500
     const pressed = ui.press({ key: 'answer' })
+    await clock.settle()
     await $.tool.call({ tool: WITHDRAW, id: 1 })
-    held.letGo()
+    await clock.advance(500)
     await pressed
     await clearTakingOnAnotherOne($, seated)
 
-    // #2 stays the one selected, its why drawn, and the task back under #1 stays shut.
-    expect(await textOf(ui, 'task-2')).toContain(XCODE_TASK.why)
-    expect(await textOf(ui, 'task-1')).not.toContain(ROTATE.why)
     expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
   })
 
-  test("a field open on a task the join after /clear numbers anew, as another session's task takes its number, closes", async ($, on) => {
+  test("a task the join after /clear numbers anew, as another session's task takes its number, keeps its field, its draft and the ring", async ($, on) => {
     // Session x's slot is first in the store: the join after /clear takes its task on first.
     const seated = seat(on, { [KEYS.session('session-x')]: { tasks: [], seenMs: NOW, nextId: 1 } })
+    const { world, clock } = seated
+    const failures = 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error'
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(inline(60))
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: failures, kind: 'change' })
+    await clock.settle()
+    await clearTakingOnAnotherOne($, seated)
+
+    // The Xcode task is #3 now, still selected, its field open with the draft; session x's task is #1.
+    expect(await textOf(ui, 'task-3')).toContain(XCODE_TASK.title)
+    expect((await ui.find({ type: 'Input', key: 'answer-3' }))?.props.value).toBe(failures)
+    expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
+
+    // The ring went along: moved onto the field, it leaves the rows as they are.
+    const rows = world.opens.at(-1)?.rows
+    await $.ui.focus(ringTo('answer-3'))
+    await clock.settle()
+    expect(world.opens.at(-1)?.rows).toBe(rows)
+  })
+
+  test("a task the join after /clear keeps under its number, another session's taken on under a new one, keeps its field", async ($, on) => {
+    const seated = seat(on)
     await start($)
 
     await $.tool.call(XCODE_TASK)
@@ -3295,10 +3347,10 @@ describe('across sessions', () => {
     await seated.clock.settle()
     await clearTakingOnAnotherOne($, seated)
 
-    // Session x's task is #1 now, the one selected, and the Xcode task #3.
-    expect(await textOf(ui, 'task-1')).toContain(ROTATE.why)
-    expect(await textOf(ui, 'task-3')).toContain(XCODE_TASK.title)
-    expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
+    // Session x's task is #3 now, and the Xcode task, still #1, stays selected.
+    expect(await textOf(ui, 'task-3')).toContain(ROTATE.title)
+    expect(await textOf(ui, 'task-3')).not.toContain(ROTATE.why)
+    expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeDefined()
   })
 
   test('a session that ends after /clear before its join has begun ends all the same and takes nothing quiet', async ($, on) => {

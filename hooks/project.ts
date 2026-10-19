@@ -358,6 +358,8 @@ function dropLegacyCopy(project: Project, id: string, legacy: LegacyEdit) {
 export type Adoption = {
   /** Its own tasks (a resumed session) and those of sessions that ended or went quiet. */
   adopted: Task[]
+  /** Those it numbered anew, another having drawn their numbers too: each as it was, with its new number. */
+  renumbered: { task: Task; id: number }[]
   /**
    * Its notes of what it took: each kept in its slot, so a crash anywhere
    * after leaves no task twice. Until that write lands, a session it took
@@ -393,6 +395,7 @@ export function adopt(project: Project, sessionId: string, nowMs: number, known:
   const all = project.all
   const ids = Object.keys(all).sort((a, b) => Number(b === sessionId) - Number(a === sessionId))
   const adopted: Task[] = []
+  const renumbered: Adoption['renumbered'] = []
   const took: Record<string, Took> = {}
   const removed: string[] = []
   const legacy = ownLegacy(project, sessionId)
@@ -410,8 +413,12 @@ export function adopt(project: Project, sessionId: string, nowMs: number, known:
     const held = heldIn(project, id, slot)
 
     for (const task of held) {
-      const isDrawn = adopted.some(one => one.id === task.id) || drawn.includes(task.id)
-      adopted.push(isDrawn ? { ...task, id: nextId++ } : task)
+      if (adopted.some(one => one.id === task.id) || drawn.includes(task.id)) {
+        renumbered.push({ task, id: nextId })
+        adopted.push({ ...task, id: nextId++ })
+      } else {
+        adopted.push(task)
+      }
     }
 
     if (id === sessionId) {
@@ -449,7 +456,7 @@ export function adopt(project: Project, sessionId: string, nowMs: number, known:
 
   adopted.sort((a, b) => a.id - b.id)
 
-  return { adopted, took, nextId, removed, legacy }
+  return { adopted, renumbered, took, nextId, removed, legacy }
 }
 
 /**

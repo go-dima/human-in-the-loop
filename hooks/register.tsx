@@ -1107,6 +1107,8 @@ async function load($: EngineInterface) {
   const count = await read($, nextId)
   let project = stored
   let adoption!: Adoption
+  // Tasks the process held that the join numbers anew.
+  let moves: Move[] = []
   // Tasks the process didn't hold: their numbers may have named others here.
   let arrived: Task[] = []
 
@@ -1119,12 +1121,13 @@ async function load($: EngineInterface) {
     const done = current.filter(task => task.sessionId === live.sessionId && !isShown(task))
     project = withHeld(stored, holder, slotFrom(current, notes, count, nowMs), nowMs)
     adoption = adopt(project, live.sessionId, nowMs, done.map(task => task.id), live.endedMs !== undefined)
-    arrived = adoption.adopted.filter(task => !current.some(one => isSameTask(one, task)))
+    moves = adoption.renumbered.filter(({ task }) => current.some(one => isSameTask(one, task))).map(({ task, id }) => ({ from: task.id, to: id }))
+    arrived = adoption.adopted.filter(task => !current.some(one => isSameTask(one, task)) && !moves.some(move => move.to === task.id))
 
     return [...done, ...adoption.adopted].sort((a, b) => a.id - b.id)
   })
 
-  await dropNumbers($, arrived.map(task => task.id))
+  await renumber($, moves, arrived.map(task => task.id))
   live.readMs = nowMs
   live.hasSlot ||= live.sessionId in stored.slots
   await update($, nextId, n => Math.max(n, adoption.nextId))
@@ -1150,21 +1153,50 @@ function isSameTask(a: Task, b: Task): boolean {
   return a.id === b.id && a.sessionId === b.sessionId && a.createdMs === b.createdMs
 }
 
+/** A task the process held that the join numbered anew: the number it leaves, and the one it takes. */
+type Move = { from: number; to: number }
+
 /**
- * Lets go of what the process keeps under numbers `ids`, which name tasks
- * it didn't hold (another session drew the number too, or a resumed one
- * did): the drafts, what was typed as a task under it closed, and a field
- * open on it. Kept, they would go with the task that holds the number now.
+ * Has what the process keeps under task numbers follow its tasks through a
+ * join. A task it held that the join numbered anew (`moves`) takes its
+ * drafts, a field open on it, the ring and the selection along. Under the
+ * numbers of tasks it didn't hold (`arrived`: another session drew the
+ * number too, or a resumed one did), it lets go of the drafts, what was
+ * typed as a task under it closed, and a field open on it. Kept, they would
+ * go with the task that holds the number now.
  */
-async function dropNumbers($: EngineInterface, ids: readonly number[]) {
-  for (const id of ids) {
-    for (const field of ['answer', 'reason'] as const) {
+async function renumber($: EngineInterface, moves: readonly Move[], arrived: readonly number[]) {
+  const toOf = (id: number) => moves.find(move => move.from === id)?.to
+
+  for (const field of ['answer', 'reason'] as const) {
+    // Carried first: the number a task leaves may be one another arrived under.
+    for (const { from, to } of moves) {
+      const draft = live.drafts.get(fieldKeyOf({ id: from, field }))
+
+      if (draft !== undefined) {
+        live.drafts.set(fieldKeyOf({ id: to, field }), draft)
+      }
+
+      if (live.ring === fieldKeyOf({ id: from, field })) {
+        live.ring = fieldKeyOf({ id: to, field })
+      }
+    }
+
+    for (const id of arrived) {
       live.drafts.delete(fieldKeyOf({ id, field }))
       live.closed.delete(fieldKeyOf({ id, field }))
     }
   }
 
-  await update($, editing, field => (field !== null && ids.includes(field.id) ? null : field))
+  await update($, editing, field => {
+    if (field === null) {
+      return null
+    }
+
+    const to = toOf(field.id)
+    return to !== undefined ? { ...field, id: to } : arrived.includes(field.id) ? null : field
+  })
+  await update($, selectedId, id => (id === null ? id : (toOf(id) ?? id)))
 }
 
 /**
@@ -1955,8 +1987,7 @@ async function answer($: EngineInterface, id: number, text: string, how: How, is
 }
 
 async function startEditing($: EngineInterface, id: number, field: Editing['field']) {
-  // Pressed on a drawing from before its task closed, it opens no field: a
-  // field open on another task stays open.
+  // Pressed on a drawing from before its task closed, it leaves the pane as it is.
   if (!(await isOpenNow($, id))) {
     return
   }

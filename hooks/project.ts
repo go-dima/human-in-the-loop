@@ -261,6 +261,9 @@ const refOf = (task: Task): TaskRef => ({ id: task.id, createdMs: task.createdMs
 
 const isSameRef = (one: TaskRef, other: TaskRef) => one.id === other.id && one.createdMs === other.createdMs
 
+/** Whether `one` and `other` are one task: a number alone can name two, drawn by two sessions at once. */
+export const isSameTask = (one: Task, other: Task) => one.sessionId === other.sessionId && isSameRef(one, other)
+
 /** The refs of `refs` that `others` doesn't name. */
 const without = (refs: readonly TaskRef[], others: readonly TaskRef[]) => refs.filter(ref => !others.some(other => isSameRef(other, ref)))
 

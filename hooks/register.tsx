@@ -56,6 +56,7 @@ import {
   floorOf,
   hasLegacyPeer,
   isEmptyEdit,
+  isSameTask,
   isSlot,
   isTakenFrom,
   keysOf,
@@ -1146,11 +1147,6 @@ async function load($: EngineInterface) {
     // What it took on stands, and the caller shows it: the next heartbeat
     // makes the writes.
   }
-}
-
-/** Whether `a` and `b` are one task: a number alone can name two, drawn by two sessions at once. */
-function isSameTask(a: Task, b: Task): boolean {
-  return a.id === b.id && a.sessionId === b.sessionId && a.createdMs === b.createdMs
 }
 
 /** A task the process held that the join numbered anew: the number it leaves, and the one it takes. */

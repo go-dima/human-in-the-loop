@@ -3308,10 +3308,8 @@ describe('across sessions', () => {
     expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
   })
 
-  test("a task the join after /clear numbers anew, as another session's task takes its number, keeps its field, its draft and the ring", async ($, on) => {
-    // Session x's slot is first in the store: the join after /clear takes its task on first.
-    const seated = seat(on, { [KEYS.session('session-x')]: { tasks: [], seenMs: NOW, nextId: 1 } })
-    const { world, clock } = seated
+  test("a task the join after a resume in place numbers anew, as the resumed session's own task keeps the number, keeps its field, its draft and the ring", async ($, on) => {
+    const { world, clock } = seat(on)
     const failures = 'LoginTests.testExpiredToken failed, and CartTests.testCouponRounding failed with a rounding error'
     await start($)
 
@@ -3321,9 +3319,14 @@ describe('across sessions', () => {
     await ui.press({ key: 'answer' })
     await ui.input({ key: 'answer-1', text: failures, kind: 'change' })
     await clock.settle()
-    await clearTakingOnAnotherOne($, seated)
+    // Session 0 drew #1 at the same moment as this one, and ended; this one resumes it in place.
+    world.store[KEYS.session('session-0')] = { tasks: [{ ...ROTATE, id: 1, sessionId: 'session-0' }], seenMs: NOW - 60_000, endedMs: NOW - 60_000, nextId: 2 }
+    world.sessionId = 'session-0'
+    await $.session.end({ reason: 'resume', sessionId: 'session-1', resume: { id: 'session-0' } })
+    await clock.advance(1)
+    await clock.settle()
 
-    // The Xcode task is #3 now, still selected, its field open with the draft; session x's task is #1.
+    // The Xcode task is #3 now, still selected, its field open with the draft; session 0's own task keeps #1.
     expect(await textOf(ui, 'task-3')).toContain(XCODE_TASK.title)
     expect((await ui.find({ type: 'Input', key: 'answer-3' }))?.props.value).toBe(failures)
     expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
@@ -3335,8 +3338,9 @@ describe('across sessions', () => {
     expect(world.opens.at(-1)?.rows).toBe(rows)
   })
 
-  test("a task the join after /clear keeps under its number, another session's taken on under a new one, keeps its field", async ($, on) => {
-    const seated = seat(on)
+  test("after /clear the tasks the process holds keep their numbers and the open field, though another session's slot holding one of them comes first", async ($, on) => {
+    // Session x's slot is first in the store.
+    const seated = seat(on, { [KEYS.session('session-x')]: { tasks: [], seenMs: NOW, nextId: 1 } })
     await start($)
 
     await $.tool.call(XCODE_TASK)
@@ -3351,6 +3355,10 @@ describe('across sessions', () => {
     expect(await textOf(ui, 'task-3')).toContain(ROTATE.title)
     expect(await textOf(ui, 'task-3')).not.toContain(ROTATE.why)
     expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeDefined()
+
+    // Claude withdrawing #1 withdraws the Xcode task.
+    await $.tool.call({ tool: WITHDRAW, id: 1 })
+    expect(seated.world.toasts.at(-1)).toBe('Claude withdrew the task: Run xcodebuild test on your Mac, paste the failures')
   })
 
   test('a session that ends after /clear before its join has begun ends all the same and takes nothing quiet', async ($, on) => {

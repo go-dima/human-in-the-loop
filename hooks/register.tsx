@@ -1121,7 +1121,7 @@ async function load($: EngineInterface) {
   await update($, tasks, current => {
     const done = current.filter(task => task.sessionId === live.sessionId && !isShown(task))
     project = withHeld(stored, holder, slotFrom(current, notes, count, nowMs), nowMs)
-    adoption = adopt(project, live.sessionId, nowMs, done.map(task => task.id), live.endedMs !== undefined)
+    adoption = adopt(project, live.sessionId, nowMs, done.map(task => task.id), live.endedMs !== undefined, holder)
     moves = adoption.renumbered.filter(({ task }) => current.some(one => isSameTask(one, task))).map(({ task, id }) => ({ from: task.id, to: id }))
     arrived = adoption.adopted.filter(task => !current.some(one => isSameTask(one, task)) && !moves.some(move => move.to === task.id))
 
@@ -1180,8 +1180,11 @@ async function renumber($: EngineInterface, moves: readonly Move[], arrived: rea
 
     for (const id of arrived) {
       live.drafts.delete(fieldKeyOf({ id, field }))
-      live.closed.delete(fieldKeyOf({ id, field }))
     }
+  }
+
+  for (const id of arrived) {
+    live.closed.delete(fieldKeyOf({ id, field: 'answer' }))
   }
 
   await update($, editing, field => {

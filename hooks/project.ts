@@ -386,7 +386,9 @@ export type Adoption = {
  *
  * Two sessions assigning at the same moment can draw one number (the store
  * has no way to reserve one): where their tasks meet here, the session's own
- * keep theirs, the numbers its Claude knows, and a later one gets a new one.
+ * keep theirs, the numbers its Claude knows, then those of `holder`, the
+ * session whose tasks the process holds (the one it left with /clear or a
+ * resume in place), the numbers the user knows, and a later one gets a new one.
  * So does one with a number in `known`, the session's own tasks that it is
  * done with, in no slot, or in a 0.1.4 note of tasks taken from it: a copy
  * of that note a 0.1.4 session's write puts back would take it again.
@@ -394,9 +396,10 @@ export type Adoption = {
  * A session taking the project on as it ends (`isEnding`) takes nothing from
  * a quiet one, which may come back: the next session to start takes it on.
  */
-export function adopt(project: Project, sessionId: string, nowMs: number, known: readonly number[] = [], isEnding = false): Adoption {
+export function adopt(project: Project, sessionId: string, nowMs: number, known: readonly number[] = [], isEnding = false, holder: string | null = null): Adoption {
   const all = project.all
-  const ids = Object.keys(all).sort((a, b) => Number(b === sessionId) - Number(a === sessionId))
+  const rank = (id: string) => (id === sessionId ? 0 : id === holder ? 1 : 2)
+  const ids = Object.keys(all).sort((a, b) => rank(a) - rank(b))
   const adopted: Task[] = []
   const renumbered: Adoption['renumbered'] = []
   const took: Record<string, Took> = {}

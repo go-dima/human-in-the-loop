@@ -1,5 +1,5 @@
 import type { Editing, Task } from '../types'
-import { MAX_WHY, isActive, waitingOf } from './tasks'
+import { MAX_OPTION, MAX_WHY, isActive, waitingOf } from './tasks'
 import { ago, cellsOf, clip, printable, rowsOf } from './text'
 
 /**
@@ -84,7 +84,7 @@ export function savedOf(task: Task): string {
 export function actionsOf(task: Task, canType: boolean): { key: string; hotkey: string; label: string; option?: string }[] {
   const choices =
     task.kind === 'choose' && task.options !== undefined
-      ? task.options.map((option, i) => ({ key: `option-${i + 1}`, hotkey: String(i + 1), label: printable(option, 60), option }))
+      ? task.options.map((option, i) => ({ key: `option-${i + 1}`, hotkey: String(i + 1), label: printable(option, MAX_OPTION), option }))
       : [{ key: 'done', hotkey: 'd', label: 'Done' }]
 
   const typed = canType
@@ -143,24 +143,36 @@ export function placeholderOf(text: string, label: string, submitLabel: string, 
 }
 
 /**
+ * Whether the terminal cuts a label `head` cells wide short, with `rest`
+ * cells after it on a row `columns` across, and wraps it onto a second: a row
+ * too narrow takes from the label and what follows it each its share of what
+ * the row lacks, and rounds where the label ends.
+ */
+function isLabelCut(head: number, rest: number, columns: number): boolean {
+  return Math.round((head * columns) / (head + rest)) < head
+}
+
+/**
  * The rows a field takes across the pane's body, `columns` wide, holding
- * `text`. Typed in, the terminal wraps the text beside the label, a column
- * short of the field for the cursor, and a row too narrow for the label, the
- * field and the hint, by more than the column the field gives up, squeezes
- * the label and the hint onto a second. Else it draws one row, the text cut
- * short, and a text past the row squeezes the label onto a second.
+ * `text`. The terminal draws its label, the field and, while it has the
+ * keys, the hint on one row, and the label, cut short, wraps onto a second,
+ * as does the hint. Typed in, the field wraps the text a column short of it,
+ * for the cursor; else it cuts the text, or the placeholder, to one row.
  */
 export function fieldRowsOf(label: string, submitLabel: string, text: string, isTyping: boolean, columns: number): number {
+  const head = cellsOf(`${label}: `)
+  const field = fieldColumnsOf(label, submitLabel, columns)
+
   if (!isTyping) {
-    return text !== '' && cellsOf(`${label}: ${text}`) > columns ? 2 : 1
+    // The placeholder is cut to the field.
+    return isLabelCut(head, text === '' ? field : cellsOf(text), columns) ? 2 : 1
   }
 
-  const width = fieldColumnsOf(label, submitLabel, columns) - 1
-  const rows = text.split('\n').reduce((rows, line) => rows + rowsOf(line, width), 0)
-  // What the field draws, the placeholder cut to the field or the text and the cursor, less the column it gives up.
-  const drawn = text === '' ? width : cellsOf(text)
+  const rows = text.split('\n').reduce((rows, line) => rows + rowsOf(line, field - 1), 0)
+  // The placeholder cut to the field, or the text and the cursor.
+  const drawn = text === '' ? field : cellsOf(text) + 1
 
-  return Math.max(rows, cellsOf(`${label}: `) + drawn + cellsOf(` ⏎ ${submitLabel}`) > columns ? 2 : 1)
+  return Math.max(rows, isLabelCut(head, drawn + cellsOf(` ⏎ ${submitLabel}`), columns) ? 2 : 1)
 }
 
 /** The `i`th saved row's Send now: the first answers `s`. */

@@ -131,6 +131,8 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     appendMs: 0,
     /** How long the surface takes to open a pane. */
     openMs: 0,
+    /** How long the surface takes to say which panes are open: it says so as they were when asked. */
+    panesMs: 0,
     /** How long the engine takes to attach a client once the plugin's hooks have seen it. */
     attachMs: 0,
     /** Set, the engine can't list the plugin's panes. */
@@ -244,14 +246,20 @@ function seat(on: On, store: Record<string, unknown> = {}) {
     world.isPaneOpen = false
     return { value: undefined }
   })
-  on('ui.panes', () => {
+  on('ui.panes', async () => {
     world.panesAsked += 1
 
     if (world.isPanesFailing) {
       return { deny: 'The surface is busy.' }
     }
 
-    return { value: world.isPaneOpen ? [{ id: 'my-tasks', title: 'My tasks', isShown: true, isFocused: true, isPlaced: !world.isNarrow }] : [] }
+    const value = world.isPaneOpen ? [{ id: 'my-tasks', title: 'My tasks', isShown: true, isFocused: true, isPlaced: !world.isNarrow }] : []
+
+    if (world.panesMs > 0) {
+      await clock.sleep(world.panesMs)
+    }
+
+    return { value }
   })
   on('ui.focus', () => ({}))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -973,6 +981,48 @@ describe('long titles', () => {
     expect(world.isPaneOpen).toBe(false)
   })
 
+  test('a re-size the surface answers late, as Claude withdraws the last task, leaves the pane closed', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(64))
+    await ui.press({ key: 'answer' })
+    const rows = world.opens.at(-1)?.rows ?? 0
+
+    // The answer takes a row more, and the surface says late, as it was when
+    // asked, that the pane is open: Claude withdraws the task meanwhile.
+    world.panesMs = 500
+    const typing = ui.input({ key: 'answer-1', text: 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding', kind: 'change' })
+    await clock.advance(1)
+    await $.tool.call({ tool: WITHDRAW, id: 1, reason: 'Found them in the CI logs' })
+    await clock.advance(500)
+    await typing
+    await clock.settle()
+
+    expect(world.isPaneOpen).toBe(false)
+    expect(world.opens.at(-1)?.rows).toBe(rows)
+  })
+
+  test('a re-size the surface answers late, as the pane is hidden, leaves it hidden', async ($, on) => {
+    const { world, clock } = seat(on)
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    const ui = await $.ui.mount(inline(64))
+    await ui.press({ key: 'answer' })
+
+    world.panesMs = 500
+    const typing = ui.input({ key: 'answer-1', text: 'Two failures: LoginTests.testExpiredToken and CartTests.testCouponRounding', kind: 'change' })
+    await clock.advance(1)
+    await ui.press({ key: 'hide' })
+    await clock.advance(500)
+    await typing
+    await clock.settle()
+
+    expect(world.isPaneOpen).toBe(false)
+  })
+
   test('every open task shows its whole title, wrapping, with its age after it in the same text', async ($, on) => {
     seat(on, earlier([INSTRUMENTS, XCODE_LONG]))
     await start($)
@@ -1004,17 +1054,18 @@ describe('long titles', () => {
     // 60 across: `Answer: ` and ` ⏎ send` leave the field 45 columns, its text 44.
     expect(fieldRowsOf('Answer', 'send', 'x'.repeat(44), true, 60)).toBe(1)
     expect(fieldRowsOf('Answer', 'send', 'x'.repeat(45), true, 60)).toBe(2)
-    // Out of the keys, one row, or two once the label is squeezed.
-    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(52), false, 60)).toBe(1)
-    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(53), false, 60)).toBe(2)
+    // Out of the keys, the text is cut to one row, and the label, cut short, wraps onto a second:
+    // as Claude Code 2.1.296 drew 56 and 57 characters at 64 columns.
+    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(56), false, 60)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', 'x'.repeat(57), false, 60)).toBe(2)
     // However narrow the pane, the terminal gives the field 12 columns, its text 11.
     expect(fieldRowsOf('Answer', 'send', 'x'.repeat(22), true, 20)).toBe(2)
     expect(fieldRowsOf('Answer', 'send', 'x'.repeat(23), true, 20)).toBe(3)
   })
 
-  test('a row too narrow for the label, the field and the hint squeezes them onto a second, as the terminal does around 30 columns', () => {
+  test('a row too narrow for the label, the field and the hint takes its lack from each, and what is cut short wraps onto a second', () => {
     // As Claude Code 2.1.296 drew them at 30, 29 and 28 columns: bodies 26, 25 and 24 across.
-    // The placeholder takes the field's 12 columns, the text its cells and the cursor's; the field gives up one.
+    // The placeholder takes the field's 12 columns, the text its cells and the cursor's: a row a cell short cuts only the field.
     expect(fieldRowsOf('Answer', 'send', '', true, 26)).toBe(1)
     expect(fieldRowsOf('Answer', 'send', '', true, 25)).toBe(2)
     expect(fieldRowsOf('Reason', 'reject', '', true, 26)).toBe(2)
@@ -1022,6 +1073,9 @@ describe('long titles', () => {
     expect(fieldRowsOf('Answer', 'send', 'abcdefghij', true, 25)).toBe(1)
     expect(fieldRowsOf('Answer', 'send', 'abcdefghijk', true, 26)).toBe(1)
     expect(fieldRowsOf('Answer', 'send', 'abcdefghijk', true, 25)).toBe(2)
+    // Out of the keys, the placeholder cut to the field, at 23 and 22 columns.
+    expect(fieldRowsOf('Answer', 'send', '', false, 19)).toBe(1)
+    expect(fieldRowsOf('Answer', 'send', '', false, 18)).toBe(2)
   })
 
   test('a field squeezed onto a second row in a narrow pane asks for that row', async ($, on) => {

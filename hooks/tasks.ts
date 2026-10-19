@@ -6,7 +6,7 @@ export const MAX_OPEN = 5
 export const MAX_TITLE = 80
 /** The longest why or done-when a task keeps, and the pane draws. */
 export const MAX_WHY = 300
-const MAX_OPTION = 60
+export const MAX_OPTION = 60
 /** Answers longer than this are named in a digest, not quoted. */
 const MAX_INLINE_ANSWER = 2000
 

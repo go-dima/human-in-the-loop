@@ -312,6 +312,8 @@ const live = {
   ring: undefined as string | undefined,
   /** The rows the pane last asked for. */
   rows: 0,
+  /** How many times the mod closed the pane: a re-size under way leaves it closed (see `fit`). */
+  closes: 0,
   /** The re-sizes keys and ring moves asked for and not yet done: each waits for the one before (see `refit`). */
   refitQueue: Promise.resolve() as Promise<unknown>,
 }
@@ -984,7 +986,7 @@ export const register: Register = on => {
             {hintOf(view)}
           </Text>
           <Box flexShrink={0}>
-            <Button key="hide" plain dimColor role="dismiss" label={HIDE} onPress={() => $.ui.close({ id: PANE })} />
+            <Button key="hide" plain dimColor role="dismiss" label={HIDE} onPress={() => closePane($)} />
           </Box>
         </Box>
       </Box>
@@ -1591,10 +1593,17 @@ async function refresh($: EngineInterface): Promise<boolean> {
   $.ui.status(statusOf(shown, live.elsewhere))
 
   if (shown.length === 0) {
-    await $.ui.close({ id: PANE }).catch(() => undefined)
+    await closePane($).catch(() => undefined)
   }
 
   return shown.length > 0
+}
+
+/** Closes the My tasks pane, and has a re-size under way leave it closed. */
+function closePane($: EngineInterface): Promise<void> {
+  live.closes += 1
+
+  return $.ui.close({ id: PANE })
 }
 
 /**
@@ -1670,11 +1679,13 @@ function openKeyOf(field: Editing | null): string | undefined {
 /** Re-sizes the pane to `wanted` rows, or else to what it holds now, when it is on screen. */
 async function fit($: EngineInterface, wanted?: number) {
   const rows = wanted ?? (await rowsWanted($))
+  const closes = live.closes
   // Asked once the rows are known, as the pane re-sizes: one that closed
-  // meanwhile, its last task gone, stays closed.
+  // meanwhile, its last task gone, stays closed, as does one closed while
+  // the surface answers.
   const panes = await $.ui.panes().catch(() => [])
 
-  if (panes.some(pane => pane.id === PANE && pane.isPlaced)) {
+  if (live.closes === closes && panes.some(pane => pane.id === PANE && pane.isPlaced)) {
     await openAt($, rows, false)
   }
 }

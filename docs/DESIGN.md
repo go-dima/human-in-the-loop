@@ -167,7 +167,7 @@ A pane (`$.ui.open({ id: 'tasks', rows })`, drawn by `ui.render` on `Pane`). In 
 
 ### Answering
 
-`r: Answer…` turns the selected task's buttons into a one-line `Input` in the pane, with the focus moved into it (`autoFocus`, then `$.ui.focus`). The terminal sizes a field by the pane's body, so it spans the body and the pane grows as the text wraps. Each task keeps its own draft, through another task's field and through Hide. Enter does the default for Claude's state; the button beside it does the other one. An answer entered or pressed for a task that closed meanwhile (Claude withdrew it, or it was answered on another surface) isn't saved: a toast says so, and what was typed goes to the prompt box. A task Claude withdraws takes its open field along, and what was typed in it: put in the prompt box unasked, it would join whatever the user is writing there.
+`r: Answer…` turns the selected task's buttons into a one-line `Input` in the pane, with the focus moved into it (`autoFocus`, then `$.ui.focus`). The terminal sizes a field by the pane's body, so it spans the body and the pane grows as the text wraps. Each task keeps its own draft, through another task's field and through Hide. Enter does the default for Claude's state; the button beside it does the other one. An answer entered or pressed for a task that closed meanwhile (Claude withdrew it, or it was answered on another surface) isn't saved: a toast says so, and what was typed goes to the prompt box. Pressed for such a task, a title, `Answer…` or `Reject…` leaves the pane as it is. A task Claude withdraws takes its open field along, and what was typed in it: put in the prompt box unasked, it would join whatever the user is writing there.
 
 Claude idle:
 

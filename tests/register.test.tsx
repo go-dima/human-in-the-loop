@@ -3261,7 +3261,7 @@ describe('across sessions', () => {
     expect((await ui.find({ type: 'Input', key: 'answer-2' }))?.props.value).toBe('Pixel 8 passes')
   })
 
-  test('Answer… pressed as Claude withdraws its task opens no field on a task back under its number after /clear', async ($, on) => {
+  test('Answer… pressed as Claude withdraws its task neither selects nor opens a field on a task back under its number after /clear', async ($, on) => {
     const seated = seat(on)
     const held = holdingPresses(on)
     await start($)
@@ -3276,8 +3276,28 @@ describe('across sessions', () => {
     await pressed
     await clearTakingOnAnotherOne($, seated)
 
-    // The task back under #1 is the one selected, its buttons drawn.
+    // #2 stays the one selected, its why drawn, and the task back under #1 stays shut.
+    expect(await textOf(ui, 'task-2')).toContain(XCODE_TASK.why)
+    expect(await textOf(ui, 'task-1')).not.toContain(ROTATE.why)
+    expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
+  })
+
+  test("a field open on a task the join after /clear numbers anew, as another session's task takes its number, closes", async ($, on) => {
+    // Session x's slot is first in the store: the join after /clear takes its task on first.
+    const seated = seat(on, { [KEYS.session('session-x')]: { tasks: [], seenMs: NOW, nextId: 1 } })
+    await start($)
+
+    await $.tool.call(XCODE_TASK)
+    await $.tool.call(ANDROID_TASK)
+    const ui = await $.ui.mount(PANE)
+    await ui.press({ key: 'answer' })
+    await ui.input({ key: 'answer-1', text: 'Two failures', kind: 'change' })
+    await seated.clock.settle()
+    await clearTakingOnAnotherOne($, seated)
+
+    // Session x's task is #1 now, the one selected, and the Xcode task #3.
     expect(await textOf(ui, 'task-1')).toContain(ROTATE.why)
+    expect(await textOf(ui, 'task-3')).toContain(XCODE_TASK.title)
     expect(await ui.find({ type: 'Input', key: 'answer-1' })).toBeUndefined()
   })
 

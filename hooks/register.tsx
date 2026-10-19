@@ -1955,6 +1955,12 @@ async function answer($: EngineInterface, id: number, text: string, how: How, is
 }
 
 async function startEditing($: EngineInterface, id: number, field: Editing['field']) {
+  // Pressed on a drawing from before its task closed, it opens no field: a
+  // field open on another task stays open.
+  if (!(await isOpenNow($, id))) {
+    return
+  }
+
   const key = fieldKeyOf({ id, field })
 
   forget(key)

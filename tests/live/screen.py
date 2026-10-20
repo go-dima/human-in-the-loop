@@ -253,19 +253,40 @@ class Claude:
 
 
 def has_pane(screen):
-    """Whether the pane is drawn whole: its frame, top to bottom, around its head or a task, which lead with ☐ or ✓ as the status line does not."""
+    """Whether the pane is drawn whole, around its head or a task, which lead with ☐ or ✓ as the status line does not: framed above the prompt, or docked beside the transcript."""
     try:
         return any(row.startswith(('☐', '✓')) for row in pane_body(screen))
     except StopIteration:
         return False
 
 
+def placement(screen):
+    """Where the pane is drawn: `inline`, framed above the prompt, or `dock`, beside the transcript."""
+    return 'inline' if frame_top(screen.split('\n')) is not None else 'dock'
+
+
+def frame_top(lines):
+    """The row a framed pane starts on: its frame's top, with the close mark. A toast's frame has none."""
+    return next((i for i, line in enumerate(lines) if line.lstrip().startswith('╭') and '✕' in line), None)
+
+
 def pane_body(screen):
-    """The rows inside the pane's frame, frame and padding stripped, in order."""
+    """The pane's rows in order, its frame and padding stripped."""
     lines = screen.split('\n')
-    top = next(i for i, line in enumerate(lines) if line.lstrip().startswith('╭'))
+    top = frame_top(lines)
+    if top is None:
+        return dock_body(lines)
     bottom = next(i for i, line in enumerate(lines) if i > top and line.lstrip().startswith('╰'))
     return [line.strip()[1:-1].rstrip()[1:] if line.strip().startswith('│') else line for line in lines[top + 1 : bottom]]
+
+
+def dock_body(lines):
+    """The rows right of the rule a docked pane draws down the screen's height, its close mark's row gone."""
+    columns = [{i for i, c in enumerate(line) if c == '│'} for line in lines]
+    rule = max(set().union(*columns), key=lambda i: sum(i in found for found in columns), default=None)
+    if rule is None or sum(rule in found for found in columns) < len(lines) // 2:
+        raise StopIteration
+    return [line[rule + 1 :].rstrip() for line in lines if len(line) > rule and line[rule] == '│'][1:]
 
 
 if __name__ == '__main__':

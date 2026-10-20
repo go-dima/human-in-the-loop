@@ -4,8 +4,10 @@ Run with `python3 tests/live/test_pane.py` from the repository's root, with
 `claude` and `tmux` on the PATH. Each case seeds tasks an ended session left,
 opens /my-tasks in a terminal of the given size and reads the screen back:
 every title shows whole, nothing is cut off at the pane's bottom, and the
-pane asks for no rows it leaves empty. With RENDERS_DIR set, each screen a
-test reads is kept there, and `tests/live/renders.py` lays them out.
+pane asks for no rows it leaves empty. Below 110 columns the pane is framed
+above the prompt; from 110 it docks beside the transcript, about 88 columns
+at most. With RENDERS_DIR set, each screen a test reads is kept there, and
+`tests/live/renders.py` lays them out.
 """
 
 import os
@@ -14,10 +16,13 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from screen import Claude, pane_body  # noqa: E402
+from screen import Claude, pane_body, placement  # noqa: E402
 
 ROOT = os.environ.get('PLUGIN_DIR') or os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-WIDTHS = (36, 48, 64, 100)
+# Framed, then each side of where the pane docks (110), and past where the
+# dock stops growing.
+WIDTHS = (36, 48, 64, 100, 109, 110, 144, 200)
+DOCK_FROM = 110
 # Tall enough that the layout spares the pane every row it asks for.
 HEIGHT = 90
 
@@ -79,19 +84,23 @@ class Pane(unittest.TestCase):
         finally:
             claude.close()
         body = pane_body(screen)
-        context = f'at {columns} columns the pane drew:\n' + '\n'.join(body)
+        context = f'at {columns} columns the pane drew {placement(screen)}:\n' + '\n'.join(body)
+        self.assertEqual(placement(screen), 'dock' if columns >= DOCK_FROM else 'inline', context)
         return body, context
 
     def assert_fits(self, body, context):
-        # The foot is the last row, a blank one above it: none cut off below
-        # it, and none asked for and left empty.
-        self.assertIn('Hide', body[-1], context)
-        self.assertEqual(body[-2].strip(), '', context)
-        self.assertNotEqual(body[-3].strip(), '', 'a row asked for and left empty\n' + context)
+        # The foot ends what is drawn, a blank row above it: none cut off
+        # below it. Framed, it is the pane's last row, none asked for and
+        # left empty; docked, the pane runs on to the screen's bottom.
+        rows = [row.strip() for row in body]
+        foot = max(i for i, row in enumerate(rows) if row)
+        self.assertIn('Hide', rows[foot], 'the pane is cut off\n' + context)
+        self.assertEqual(rows[foot - 1], '', context)
+        self.assertNotEqual(rows[foot - 2], '', 'a row asked for and left empty\n' + context)
 
     def test_titles_wrap_whole_and_the_pane_fits_them(self):
         # As many tasks as fit the pane's 18 rows at each width.
-        for columns, tasks in ((36, TASKS[:2]), (48, TASKS[:1] + TASKS[2:]), (64, TASKS), (100, TASKS)):
+        for columns, tasks in ((36, TASKS[:2]), (48, TASKS[:1] + TASKS[2:]), *((width, TASKS) for width in WIDTHS[2:])):
             with self.subTest(columns=columns):
                 body, context = self.draw(tasks, columns)
                 text = joined(body)
@@ -137,7 +146,7 @@ class Pane(unittest.TestCase):
                 self.assertIn('3m · from an earlier session', joined(title_rows), context)
 
     def test_emoji_take_the_cells_the_terminal_draws_them_in(self):
-        for columns in (36, 100):
+        for columns in (36, 100, 110, 200):
             with self.subTest(columns=columns):
                 body, context = self.draw([{'id': 7, 'title': EMOJI, 'why': 'The ⌛ build waits on it.', 'kind': 'answer'}], columns)
 
@@ -145,7 +154,7 @@ class Pane(unittest.TestCase):
                 self.assertIn(f'#7 {EMOJI} 3m · from an earlier session', joined(body), context)
 
     def test_saved_responses_and_titles_past_80_characters_show_whole(self):
-        for columns in (48, 64):
+        for columns in (48, 64, 110):
             with self.subTest(columns=columns):
                 body, context = self.draw(TASKS[1:2] + SAVED, columns)
                 # Send now sits beside the title's first row.
@@ -156,7 +165,7 @@ class Pane(unittest.TestCase):
                 self.assertIn('s: Send now', body[next(i for i, row in enumerate(body) if '#5' in row)], context)
 
     def test_an_open_answer_field_fits(self):
-        for columns in (36, 64):
+        for columns in (36, 64, 110, 200):
             with self.subTest(columns=columns):
                 body, context = self.draw(TASKS[1:2], columns, keys=('r',))
                 text = joined(body)
@@ -174,7 +183,7 @@ class Pane(unittest.TestCase):
 
     def test_a_long_answer_wraps_in_its_field_and_the_pane_grows_to_hold_it(self):
         # Typed after Answer…: the keys go to the field, not to the pane's hotkeys.
-        for columns in (36, 64):
+        for columns in (36, 64, 110, 200):
             with self.subTest(columns=columns):
                 body, context = self.draw(TASKS[1:2], columns, keys=('r', DRAFT))
 
@@ -192,7 +201,7 @@ class Pane(unittest.TestCase):
 
     def test_a_long_answer_out_of_the_keys_keeps_the_pane_fitted(self):
         # Tab moves the keys on: the field draws one row of its text, the label squeezed onto a second.
-        for columns in (36, 64):
+        for columns in (36, 64, 110):
             with self.subTest(columns=columns):
                 body, context = self.draw(TASKS[1:2], columns, keys=('r', DRAFT, 'Tab'))
 

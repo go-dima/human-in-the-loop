@@ -99,9 +99,17 @@ Then start a new session (or run `/reload-plugins`).
 - **Your responses become part of the conversation.** Claude reads what you answer, and the session's transcript on disk keeps it, like anything you type. That's why tasks ask you to put a secret where it belongs and press Done, never to paste it, and why an answer that looks like a secret is held first.
 - **What it adds to the conversation:** the three tools, a few lines in the system prompt telling Claude about tasks, your responses, and, at a conversation's start or after a compaction, a short list of the tasks still open.
 
-### What it sends to Claude, and which tool calls it answers
+### What the mod puts in the prompts it submits
 
-- **The prompts it submits.** When you respond to a task while Claude is idle, when Claude finishes a turn with your saved responses waiting and no task left open, or when you press **Send now**, the mod submits your response as a prompt in your own words. For each task it carries only the task's number and title and what you did: "Done", the option you chose, your answer, or your reason for rejecting it. It carries nothing else from the conversation or from your machine. One fixed line is the only other prompt it submits: "I answered a task while you were finishing your reply; my answer is above." It goes when your answer arrived during Claude's final reply.
+The mod submits a prompt in two cases, and these are all it puts in one:
+
+- **Your responses to tasks.** When you respond to a task while Claude is idle, when Claude finishes a turn with your saved responses waiting and no task left open, or when you press **Send now**, the mod submits your responses as a prompt in your own words. It opens with "My response to a task you gave me (Human in the loop):" ("My responses to tasks…" for several). Then, for each task, it gives the task's number and the title Claude gave it, and what you did: "Done.", the option you chose, your answer, or "I won't do this." with your reason.
+- **One fixed line:** "I answered a task while you were finishing your reply; my answer is above." It goes when your answer arrived during Claude's final reply.
+
+Nothing else goes into a prompt it submits. The mod reads two facts about the session, the session's id and its project folder, and puts neither in a prompt. It uses them to keep each session's tasks apart from those of other sessions in the same folder, in the plugin's own store on your machine, and to mark a task an earlier session assigned as "from an earlier session". Nothing else from the conversation, your files or your machine goes in either.
+
+### What else it sends to Claude, and which tool calls it answers
+
 - **While Claude works:** **Send now** adds the same response as a row Claude reads at its next step, with a notice in the transcript for you ("Sent your response to #3 to Claude") that Claude doesn't read.
 - **Your prompts:** the mod reads them only to recognize a long answer (`↳ Answer to #3: …`), which it turns into that same response, and to attach responses not yet sent as notes Claude reads.
 - **The tool calls it answers:** only calls to its own three tools, `assign_task`, `list_tasks` and `withdraw_task`, which the mod itself serves. Every other tool call passes through untouched.

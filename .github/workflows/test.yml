@@ -1,0 +1,82 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The engine the tests run against. Bump it on purpose, so a change in
+  # the test kit shows up as its own commit and not as a red PR.
+  CLAUDE_CODE_VERSION: 2.1.296
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+      - name: Validate the plugin
+        run: claude plugin validate .
+
+      - name: Run the tests
+        run: claude plugin test .
+
+  # The test kit checks the tree the plugin draws, never how a terminal lays
+  # it out: this job draws the pane in a real Claude Code, in tmux, and reads
+  # the screen back. No model is called.
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LANG: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code and tmux
+        run: |
+          npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" typescript@6.0.2
+          sudo apt-get update -q && sudo apt-get install -yq tmux
+
+      - name: Draw the pane at narrow and wide widths
+        env:
+          RENDERS_DIR: ${{ runner.temp }}/renders
+        run: python3 tests/live/test_pane.py
+
+      # Every screen the tests read, for a person to look over, failed or
+      # not: as text on the run's summary, and in color in the artifact.
+      - name: Lay out the renders
+        if: ${{ !cancelled() }}
+        run: python3 tests/live/renders.py "${{ runner.temp }}/renders" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the renders
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: renders
+          path: ${{ runner.temp }}/renders
+          if-no-files-found: ignore
+
+      # Loading the plugin laid its types in .claude-plugin/types.
+      - name: Type-check
+        run: tsc -p .

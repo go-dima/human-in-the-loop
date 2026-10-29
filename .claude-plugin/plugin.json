@@ -20,5 +20,14 @@
     "mod",
     "function-hooks"
   ],
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "taskWording": {
+      "type": "string",
+      "title": "Task wording",
+      "description": "How Claude words the tasks it assigns you: plain, or ASD-STE100 Simplified Technical English",
+      "options": ["plain", "ste"],
+      "default": "plain"
+    }
+  }
 }

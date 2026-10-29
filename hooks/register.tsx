@@ -43,6 +43,20 @@ const STEERING = [
   'The user sees open tasks in their My tasks pane, or opens it with /my-tasks, and their response reaches you as a message.',
 ].join('\n')
 
+/**
+ * With the `taskWording` option set to `ste`: the ASD-STE100 writing rules
+ * a regex can't check for Claude, added after the steering lines. They cover
+ * the task's title, why and done when, not Claude's replies.
+ */
+const STE_STEERING = [
+  'Write the title, why and done_when of each task in ASD-STE100 Simplified Technical English:',
+  '- Write the title as one instruction, in the imperative.',
+  '- Use the active voice.',
+  '- Write one instruction in each sentence. Use a maximum of 20 words in an instruction and 25 words in a description.',
+  '- Use one word for one meaning, and use the same word for the same thing each time.',
+  '- Use simple verb tenses. Do not use -ing forms as nouns or adjectives.',
+].join('\n')
+
 /** Resolutions pressed this close together go to Claude as one message. */
 const BATCH_MS = 800
 
@@ -173,7 +187,10 @@ function working(): boolean {
   return live.engineWorking ?? live.turns.size > 0
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  // Changing the option in /config reloads the module, so this is read once.
+  const steering = options.taskWording === 'ste' ? `${STEERING}\n${STE_STEERING}` : STEERING
+
   on('session.start', async ($, e, next) => {
     for (const tool of TOOLS) {
       await $.tool.register(tool)
@@ -455,7 +472,7 @@ export const register: Register = on => {
       return composed
     }
 
-    return { sections: [...composed.sections, { id: 'human-in-the-loop:tasks', text: STEERING, scope: 'session' }] }
+    return { sections: [...composed.sections, { id: 'human-in-the-loop:tasks', text: steering, scope: 'session' }] }
   })
 
   on('prompt.context', async ($, e, next) => {

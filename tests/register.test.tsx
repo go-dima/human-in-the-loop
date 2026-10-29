@@ -514,6 +514,29 @@ describe('the system prompt', () => {
     expect(headless.sections).toHaveLength(1)
     expect(without.sections).toHaveLength(1)
   })
+
+  test('asks for plain task wording by default', async ($, on) => {
+    seat(on)
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
+    await start($)
+
+    const composed = await $.prompt.compose({ ...COMPOSE, tools: ['Bash', ASSIGN], traits: [] })
+
+    expect(composed.sections.at(-1)?.text).not.toContain('ASD-STE100')
+  })
+
+  test('asks for ASD-STE100 task wording when the option says so', { options: { taskWording: 'ste' } }, async ($, on) => {
+    seat(on)
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
+    await start($)
+
+    const composed = await $.prompt.compose({ ...COMPOSE, tools: ['Bash', ASSIGN], traits: [] })
+    const text = composed.sections.at(-1)?.text
+
+    expect(text).toContain('assign it with mcp__human-in-the-loop__assign_task')
+    expect(text).toContain('ASD-STE100 Simplified Technical English')
+    expect(text).toContain('Use the active voice.')
+  })
 })
 
 describe('across sessions', () => {
